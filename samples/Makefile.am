@@ -28,6 +28,9 @@ install-data-local:
 	fi
 
 EXTRA_DIST= \
+	lua/pass.lua \
+	lua/getrandom.lua \
+	lua/synthetic.lua \
 	swtpm-create-tpmca \
 	swtpm-create-user-config-files \
 	swtpm-localca.conf \

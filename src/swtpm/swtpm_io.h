@@ -46,6 +46,12 @@ typedef struct TPM_CONNECTION_FD {
 
 struct pcap_state;
 
+/* One nonblocking read per poll iteration; surplus stays in the socket.
+ * Returns 1 for a complete raw TPM 2 frame, 0 for a partial frame,
+ * 2 for EOF between frames, and -1 for invalid framing or truncated EOF. */
+int SWTPM_IO_ReadRawTPM2(int fd, unsigned char *buffer, uint32_t *used,
+                        uint32_t limit);
+
 TPM_RESULT SWTPM_IO_Init(void);
 TPM_RESULT SWTPM_IO_Connect(TPM_CONNECTION_FD *connection_fd,
                             int notify_fd);
@@ -67,4 +73,3 @@ int SWTPM_IO_GetSocketFD(void);
 #define LOAD8(buffer,offset)          (      (*(uint8_t  *)&(buffer)[(offset)]) )
 
 #endif /* _SWTPM_IO_H_ */
-

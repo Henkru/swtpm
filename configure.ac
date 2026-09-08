@@ -141,6 +141,26 @@ PKG_CHECK_MODULES([LIBTASN1],[libtasn1])
 
 PKG_CHECK_MODULES([LIBTPMS],[libtpms >= 0.11])
 
+AC_ARG_WITH([lua],
+    [AS_HELP_STRING([--with-lua], [enable Lua 5.4 socket interception (default: no)])],
+    [], [with_lua=no])
+AS_CASE([$with_lua],
+    [yes], [PKG_CHECK_MODULES([LUA], [lua >= 5.4 lua < 5.5], [],
+                [PKG_CHECK_MODULES([LUA], [lua5.4 >= 5.4 lua5.4 < 5.5], [],
+                    [PKG_CHECK_MODULES([LUA], [lua-5.4 >= 5.4 lua-5.4 < 5.5])])])
+            AC_DEFINE([WITH_LUA], [1], [Build Lua interception])],
+    [no], [],
+    [AC_MSG_ERROR([--with-lua accepts only yes or no])])
+AM_CONDITIONAL([WITH_LUA], [test "x$with_lua" = "xyes"])
+
+dnl Packagers can supply an immutable revision/content hash for the manifest.
+AC_ARG_WITH([source-revision],
+    [AS_HELP_STRING([--with-source-revision=ID], [source revision or content hash (default: unknown)])],
+    [], [with_source_revision=unknown])
+AS_CASE([$with_source_revision], [*[[!a-zA-Z0-9._:+/=-]]*],
+    [AC_MSG_ERROR([invalid source revision])])
+AC_DEFINE_UNQUOTED([SWTPM_SOURCE_REVISION], ["$with_source_revision"], [Source provenance])
+
 
 AC_CHECK_LIB(c, clock_gettime, LIBRT_LIBS="", LIBRT_LIBS="-lrt")
 AC_SUBST([LIBRT_LIBS])
@@ -460,6 +480,7 @@ printf "with_cuse       : %5s  (no = no CUSE interface)\n" $with_cuse
 printf "with_chardev    : %5s  (no = no chardev interface)\n" $with_chardev
 printf "with_vtpm_proxy : %5s  (no = no vtpm proxy support; Linux only)\n" $with_vtpm_proxy
 printf "with_seccomp    : %5s  (no = no seccomp profile; Linux only)\n" $with_seccomp
+printf "with_lua        : %5s  (yes = Lua 5.4 socket interception)\n" $with_lua
 printf "enable_tests    : %5s  (no = no tests will run)\n" $enable_tests
 printf "\n"
 printf "active PCR banks      : %s\n" $DEFAULT_PCR_BANKS

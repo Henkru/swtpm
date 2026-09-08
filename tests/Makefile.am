@@ -14,6 +14,7 @@ TESTS_ENVIRONMENT = \
 if ENABLE_TESTS
 
 TESTS = \
+	test_lua_intercept \
 	test_vtpm_proxy \
 	test_tpm2_vtpm_proxy \
 	\

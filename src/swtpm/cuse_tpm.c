@@ -611,7 +611,7 @@ static void tpm_end(void)
     worker_thread_end();
 
     if (tpm_running && !g_disable_auto_shutdown)
-        tpmlib_maybe_send_tpm2_shutdown(tpmversion, &g_lastCommand, &g_ps);
+        tpmlib_maybe_send_tpm2_shutdown(tpmversion, &g_lastCommand, &g_ps, NULL);
 
     TPMLIB_Terminate();
 
@@ -1875,7 +1875,7 @@ int swtpm_cuse_main(int argc, char **argv, const char *prgname, const char *ifac
          * Choose the TPM version so that getting/setting buffer size works.
          * Ignore failure, for backward compatibility when TPM 1.2 is disabled.
          */
-        ret = capabilities_print_json(true, tpmversion) ? EXIT_FAILURE : EXIT_SUCCESS;
+        ret = capabilities_print_json(true, tpmversion, false) ? EXIT_FAILURE : EXIT_SUCCESS;
         goto exit;
     }
 

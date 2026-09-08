@@ -11,6 +11,9 @@ creating certificates for a TPM, and simulating the manufacturing of
 a TPM by creating a TPM's EK and platform certificates etc. Please read 
 the READMEs in the individual tool's directory under src/.
 
+This fork supports optional Lua request/response interception for socket TPM 2
+traffic. Build with --with-lua and see samples/lua/ for examples.
+
 Please consult the Wiki for information about swtpm:
 
    https://github.com/stefanberger/swtpm/wiki

@@ -486,6 +486,11 @@ for the directory storage backend.
 The option parameter I<fsync> for the I<--tpmstate> option is supported
 for the directory storage backend.
 
+=item B<cmdarg-lua>, B<lua-api-1> (optional build feature)
+
+The socket TPM 2 frontend supports Lua interception API version 1 when built
+with C<--with-lua>. See C<--lua-script> below.
+
 =item B<cmdarg-pcap> (since v0.11)
 
 The option I<--pcap> is supported to write TPM command and response exchanges
@@ -792,6 +797,67 @@ or'ed (or added) together to get information about all of them in one query.
 
 =back
 
+=item B<--lua-script PATH> or B<--lua-script-fd N>
+
+Load one Lua 5.4 text script before accepting traffic. Requires a build configured
+with C<--with-lua> and C<swtpm socket --tpm2>. Only raw TPM 2 framing is supported,
+including QEMU's passed data FD; the optional TCG prefix is rejected. The source
+must be a regular file, limited to 1 MiB. FD arguments must be at least 3.
+
+The script returns a table containing integer C<api_version = 1> and at least one
+of C<on_request(ctx, bytes)> and C<on_response(ctx, bytes)>. Missing callbacks,
+C<nil> returns, and C<{action="pass"}> pass traffic unchanged.
+C<{action="replace", bytes=STRING}> replaces the request or response.
+The request callback may return C<{action="respond", bytes=STRING}> to bypass
+execution and invoke the response callback once on a synthetic reply. Strings
+are binary-safe. Replacement messages must have a supported TPM 2 tag, an exact
+declared length, and fit the negotiated buffer limit. Authentication is not
+recomputed.
+
+C<ctx> contains C<id>, C<generation>, C<tpm_version>, C<locality>,
+C<command_code>, C<original_request>, and a mutable per-exchange C<state> table.
+The response callback additionally receives C<effective_request>,
+C<effective_command_code>, C<backend_executed>, and C<response_source>
+(C<tpm>, C<swtpm>, or C<lua>). Synthetic exchanges have no effective request.
+Metadata is copied afresh for each callback; replacing C<ctx.state> does not
+replace the retained state table. Globals persist until process exit, including
+across TPM initialization generations. Automatic Startup/Shutdown bypass Lua.
+
+Lua is limited to 16 MiB and one million instructions per initialization or
+callback. Restricted base, string, table, and math operations are available;
+filesystem/process, package, coroutine, and debug libraries are absent. Loading,
+protected-call and metatable functions are removed. C<tpm.log(STRING)> provides
+up to 4096 bytes of diagnostic output per call. Scripts remain trusted inputs:
+instruction limits are not wall-clock isolation for C library functions.
+Script errors, invalid returns, budget violations, and capture/delivery failures
+stop swtpm with a nonzero exit status, retaining partial artifacts.
+
+=item B<--lua-log-fd N>
+
+Write incremental interception JSONL to a writable regular file. Records include
+source SHA-256, the exact source snapshot as hex, API/Lua versions, build source
+provenance, limits, original/effective requests, original/final responses,
+exchange IDs, initialization generations, monotonic timestamps, internal-command
+origin, processing and write results, diagnostics, and completion counters.
+Unreached stages have null payloads. The launcher can decode the snapshot to
+C<attack.lua> and merge provenance into its own C<manifest.json>.
+
+=item B<--lua-pcap-fd N>
+
+Write a second pcapng capture to a writable regular file. This capture contains
+only external requests dispatched to C<TPMLIB_Process()> and its original
+responses. Synthetic and swtpm-local replies produce no backend exchange.
+Internal automatic commands remain only in native capture and the event log.
+An empty backend capture is valid for an all-synthetic run.
+
+Artifact FDs are optional but recommended for recorded experiments, must refer
+to distinct files, and require a script. The Lua bridge duplicates inherited FDs
+and closes the originals after initialization and the copies on cleanup.
+Retain stderr and process exit status as well as artifacts:
+a successful socket write does not prove guest consumption, and missing exchange
+or run completion records indicate an incomplete run. Capture/log write and close
+failures fail Lua runs. See F<samples/lua/> for examples.
+
 =item B<--pcap file=<path>|fd=<file descriptor>[,truncate][,mode=E<lt>0...E<gt>][,checksums]>
 
 This option allows writing TPM command and response exchanges to a
@@ -810,8 +876,9 @@ Swtpm will also write packets that are not explicitly sent to the TPM by the
 user, but those that are sent internally, such as for example a I<TPM2_Startup>
 when I<--flags startup-clear> is used.
 
-Note that swtpm will silently ignore errors related to the writing to the
-pcap file, such as when no space is available.
+Without Lua interception, swtpm silently ignores errors related to writing the
+pcap file, such as when no space is available. Lua runs propagate these failures
+to their exit status.
 
 =item B<-h|--help>
 

@@ -147,6 +147,8 @@ static void calc_checksums(struct packet *packet,
 void pcap_state_init(struct pcap_state *ps)
 {
     ps->fd = -1;
+    ps->failed = false;
+    ps->strict = false;
     ps->cseq = g_random_int();
     ps->sseq = g_random_int();
     ps->cport = g_random_int_range(50000, 55000);
@@ -280,7 +282,8 @@ static int pcap_file_tcp_flags(struct pcap_state *ps, uint8_t flag)
 {
     struct packet packet;
 
-    pcap_packet_fill(&packet, true, 0, 0, ps);
+    if (pcap_packet_fill(&packet, true, 0, 0, ps) < 0)
+        return -1;
     packet.tcphdr.th_flags = flag;
     if (flag == TH_SYN)
         packet.tcphdr.th_ack = 0;
@@ -291,7 +294,8 @@ static int pcap_file_tcp_flags(struct pcap_state *ps, uint8_t flag)
 
     ps->cseq++;
 
-    pcap_packet_fill(&packet, false, 0, 0, ps);
+    if (pcap_packet_fill(&packet, false, 0, 0, ps) < 0)
+        return -1;
     packet.tcphdr.th_flags = flag | TH_ACK;
     calc_checksums(&packet, NULL, 0, ps);
 
@@ -300,7 +304,8 @@ static int pcap_file_tcp_flags(struct pcap_state *ps, uint8_t flag)
 
     ps->sseq++;
 
-    pcap_packet_fill(&packet, true, 0, 0, ps);
+    if (pcap_packet_fill(&packet, true, 0, 0, ps) < 0)
+        return -1;
     packet.tcphdr.th_flags = TH_ACK;
     calc_checksums(&packet, NULL, 0, ps);
 
@@ -326,15 +331,18 @@ static int pcap_file_tcp_end(struct pcap_state *ps)
  * Close the TPM command/response sequence with a simulated TCP FIN/FIN+ACK/ACK
  * and then close the pcap file descriptor.
  */
-void pcap_state_fd_close(struct pcap_state *ps)
+int pcap_state_fd_close(struct pcap_state *ps)
 {
     if (ps->fd < 0)
-        return;
+        return ps->failed ? -1 : 0;
 
-    pcap_file_tcp_end(ps);
+    if (pcap_file_tcp_end(ps) < 0)
+        ps->failed = true;
 
-    close(ps->fd);
+    if (close(ps->fd) < 0)
+        ps->failed = true;
     ps->fd = -1;
+    return ps->failed ? -1 : 0;
 }
 
 /* Start writing to the pcap file */
@@ -368,14 +376,18 @@ int pcap_packet_record_write(struct pcap_state *ps,
         return 0;
 
     if (pcap_packet_fill(&packet, to_tpm,
-                         tpm_packet_len, tpm_packet_len, ps) < 0)
+                         tpm_packet_len, tpm_packet_len, ps) < 0) {
+        ps->failed = true;
         return -1;
+    }
 
     calc_checksums(&packet, tpm_packet, tpm_packet_len, ps);
 
     ret = pcap_write(ps->fd, &packet, tpm_packet, tpm_packet_len);
-    if (ret < 0)
+    if (ret < 0) {
+        ps->failed = true;
         return ret;
+    }
 
     if (to_tpm)
         ps->cseq += tpm_packet_len;

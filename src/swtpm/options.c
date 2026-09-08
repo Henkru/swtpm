@@ -53,6 +53,20 @@
 #include "options.h"
 #include "compiler_dependencies.h"
 
+int option_parse_fd(const char *value)
+{
+    char *end;
+    unsigned long fd;
+
+    if (!value || !isdigit((unsigned char)*value))
+        return -1;
+    errno = 0;
+    fd = strtoul(value, &end, 10);
+    if (errno || *end || fd < 3 || fd > INT_MAX)
+        return -1;
+    return fd;
+}
+
 static void option_error_set(char **error, const char *format, ...)
     SWTPM_ATTRIBUTE_FORMAT(2, 3);
 

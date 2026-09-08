@@ -17,6 +17,7 @@ noinst_HEADERS = \
 	fips.h \
 	key.h \
 	locality.h \
+	lua_intercept.h \
 	logging.h \
 	main.h \
 	mainloop.h \
@@ -73,6 +74,10 @@ libswtpm_libtpms_la_SOURCES += \
 	threadpool.c
 endif
 
+if WITH_LUA
+libswtpm_libtpms_la_SOURCES += lua_intercept.c
+endif
+
 libswtpm_libtpms_la_CFLAGS = \
 	-I$(top_builddir)/include \
 	-I$(top_srcdir)/include \
@@ -83,6 +88,7 @@ libswtpm_libtpms_la_CFLAGS = \
 	$(HARDENING_CFLAGS) \
 	$(GLIB_CFLAGS) \
 	$(JSON_GLIB_CFLAGS) \
+	$(LUA_CFLAGS) \
 	$(LIBSECCOMP_CFLAGS)
 
 libswtpm_libtpms_la_LDFLAGS = \
@@ -96,6 +102,8 @@ libswtpm_libtpms_la_LIBADD = \
 	$(LIBRT_LIBS) \
 	$(LIBSECCOMP_LIBS) \
 	$(LIBCRYPTO_LIBS)
+
+libswtpm_libtpms_la_LIBADD += $(LUA_LIBS)
 
 bin_PROGRAMS = swtpm
 if WITH_CUSE

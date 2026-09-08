@@ -220,14 +220,25 @@ static void usage(FILE *file, const char *prgname, const char *iface)
     "                   the default mode is 0640;\n"
     "                   checksums enables calculation of IP and TCP checksums;\n"
     "                   the default is that no checksums are calculated;\n"
+#ifdef WITH_LUA
+    "--lua-script PATH | --lua-script-fd N\n"
+    "                 : Load a Lua API 1 script for raw socket --tpm2 traffic\n"
+    "--lua-log-fd N   : Write interception JSONL, provenance and script snapshot\n"
+    "--lua-pcap-fd N  : Write external libtpms exchanges as pcapng\n"
+#endif
     "-h|--help        : display this help screen and terminate\n"
     "\n",
     prgname, iface);
 }
 
-static void swtpm_cleanup(struct mainLoopParams *mlp, struct server *server)
+static int swtpm_cleanup(struct mainLoopParams *mlp, struct server *server)
 {
-    pcap_state_fd_close(&mlp->ps);
+    int ret;
+
+    if (pcap_state_fd_close(&mlp->ps) && mlp->lua)
+        lua_intercept_fail(mlp->lua, "cannot write or close native capture");
+    ret = lua_intercept_close(mlp->lua);
+    mlp->lua = NULL;
     free(mlp->json_profile);
     pidfile_remove();
     ctrlchannel_free(mlp->cc);
@@ -235,6 +246,7 @@ static void swtpm_cleanup(struct mainLoopParams *mlp, struct server *server)
     log_global_free();
     tpmstate_global_free();
     SWTPM_NVRAM_Shutdown();
+    return ret;
 }
 
 int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
@@ -278,6 +290,10 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
     char *chroot = NULL;
     char *profiledata = NULL;
     char *pcapdata = NULL;
+#ifdef WITH_LUA
+    const char *lua_script = NULL;
+    int lua_script_fd = -1, lua_log_fd = -1, lua_pcap_fd = -1;
+#endif
     bool need_init_cmd = true;
 #ifdef DEBUG
     time_t              start_time;
@@ -317,6 +333,12 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
         {"print-profiles",   no_argument, 0, 'N'},
         {"print-info", required_argument, 0, 'x'},
         {"pcap"      , required_argument, 0, 'A'},
+#ifdef WITH_LUA
+        {"lua-script", required_argument, 0, 256},
+        {"lua-script-fd", required_argument, 0, 257},
+        {"lua-log-fd", required_argument, 0, 258},
+        {"lua-pcap-fd", required_argument, 0, 259},
+#endif
         {NULL        , 0                , 0, 0  },
     };
 
@@ -470,6 +492,26 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
         case 'A': /* --pcap */
             pcapdata = optarg;
             break;
+#ifdef WITH_LUA
+        case 256:
+            if (lua_script || lua_script_fd >= 0)
+                goto invalid_lua_option;
+            lua_script = optarg;
+            break;
+        case 257:
+            if (lua_script || lua_script_fd >= 0 ||
+                (lua_script_fd = option_parse_fd(optarg)) < 0)
+                goto invalid_lua_option;
+            break;
+        case 258:
+            if (lua_log_fd >= 0 || (lua_log_fd = option_parse_fd(optarg)) < 0)
+                goto invalid_lua_option;
+            break;
+        case 259:
+            if (lua_pcap_fd >= 0 || (lua_pcap_fd = option_parse_fd(optarg)) < 0)
+                goto invalid_lua_option;
+            break;
+#endif
 
         case 'N': /* --print-profiles */
             printprofiles = true;
@@ -497,6 +539,16 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
         exit(EXIT_FAILURE);
     }
 
+#ifdef WITH_LUA
+    if ((lua_script || lua_script_fd >= 0 || lua_log_fd >= 0 || lua_pcap_fd >= 0) &&
+        (mlp.tpmversion != TPMLIB_TPM_VERSION_2 ||
+         (!lua_script && lua_script_fd < 0))) {
+invalid_lua_option:
+        logprintf(STDERR_FILENO, "Lua requires socket --tpm2, one script, and distinct valid FDs >= 3\n");
+        goto exit_failure;
+    }
+#endif
+
     if (chroot) {
         if (do_chroot(chroot) < 0)
             exit(EXIT_FAILURE);
@@ -523,7 +575,7 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
          * Choose the TPM version so that getting/setting buffer size works.
          * Ignore failure, for backward compatibility when TPM 1.2 is disabled.
          */
-        ret = capabilities_print_json(false, mlp.tpmversion);
+        ret = capabilities_print_json(false, mlp.tpmversion, true);
         exit(ret ? EXIT_FAILURE : EXIT_SUCCESS);
     }
 
@@ -572,6 +624,29 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
         goto exit_failure;
     }
 
+#ifdef WITH_LUA
+    if (lua_script || lua_script_fd >= 0) {
+        if (mlp.ps.fd >= 0 && (mlp.ps.fd == lua_script_fd ||
+            mlp.ps.fd == lua_log_fd || mlp.ps.fd == lua_pcap_fd))
+            goto invalid_lua_option;
+        ret = lua_intercept_open(&mlp.lua, lua_script, lua_script_fd,
+                                 lua_log_fd, lua_pcap_fd, mlp.ps.fd);
+        /* Only the bridge's copies remain open for final close accounting. */
+        if (lua_script_fd >= 0 && close(lua_script_fd))
+            ret = -1;
+        if (lua_log_fd >= 0 && close(lua_log_fd))
+            ret = -1;
+        if (lua_pcap_fd >= 0 && close(lua_pcap_fd))
+            ret = -1;
+        if (ret) {
+            lua_intercept_fail(mlp.lua, "script/artifact initialization failed");
+            goto exit_failure;
+        }
+        mlp.ps.strict = true;
+        mlp.buffer_size = TPMLIB_SetBufferSize(0, NULL, NULL);
+    }
+#endif
+
     if (server) {
         if (server_get_fd(server) >= 0) {
             mlp.fd = server_set_fd(server, -1);
@@ -614,6 +689,8 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
                                mlp.json_profile)))
             goto error_no_tpm;
         tpm_running = true;
+        mlp.initialization_generation++;
+        lua_intercept_initialized(mlp.lua);
         SWTPM_G_FREE(mlp.json_profile);
     }
 
@@ -624,11 +701,15 @@ int swtpm_main(int argc, char **argv, const char *prgname, const char *iface)
         goto error_no_sighandlers;
     }
 
-    if (install_sighandlers(notify_fd, sigterm_handler) < 0)
+    if (install_sighandlers(notify_fd, sigterm_handler) < 0) {
+        rc = TPM_FAIL;
         goto error_no_sighandlers;
+    }
 
-    if (create_seccomp_profile(false, seccomp_action) < 0)
+    if (create_seccomp_profile(false, seccomp_action) < 0) {
+        rc = TPM_FAIL;
         goto error_seccomp_profile;
+    }
 
     if (daemonize) {
         daemonize_finish();
@@ -650,7 +731,10 @@ error_no_tpm:
     close(notify_fd[1]);
     notify_fd[1] = -1;
 
-    swtpm_cleanup(&mlp, server);
+    if (rc && mlp.lua)
+        lua_intercept_fail(mlp.lua, "swtpm exited with an error");
+    if (swtpm_cleanup(&mlp, server))
+        rc = TPM_FAIL;
 
     /* Fatal initialization errors cause the program to abort */
     if (rc == 0) {

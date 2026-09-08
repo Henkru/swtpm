@@ -42,7 +42,7 @@
 
 #include <libtpms/tpm_library.h>
 
-int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion);
+int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion, bool socket);
 
 int print_profiles(void);
 

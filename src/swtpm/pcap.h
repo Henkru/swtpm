@@ -9,6 +9,9 @@
 #ifndef _SWTPM_PCAP_H
 #define _SWTPM_PCAP_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 struct pcap_state {
     int fd;
     unsigned int flags;
@@ -17,11 +20,13 @@ struct pcap_state {
     uint32_t sseq;
     uint32_t cport; // client port
     uint32_t tpmport;
+    bool failed; /* latched, including ignored legacy capture calls */
+    bool strict; /* propagate capture failures to the data transport */
 };
 
 void pcap_state_init(struct pcap_state *ps);
 void pcap_state_fd_set(struct pcap_state *ps, int fd);
-void pcap_state_fd_close(struct pcap_state *ps);
+int pcap_state_fd_close(struct pcap_state *ps);
 void pcap_state_flags_set(struct pcap_state *ps, unsigned int flags);
 int pcap_file_new(struct pcap_state *ps);
 int pcap_packet_record_write(struct pcap_state *ps,

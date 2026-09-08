@@ -120,7 +120,7 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
     TPM_RESULT          rc = 0;
     TPM_CONNECTION_FD   connection_fd;             /* file descriptor for read/write */
     unsigned char       *command = NULL;           /* command buffer */
-    uint32_t            command_length;            /* actual length of command bytes */
+    uint32_t            command_length = 0;        /* actual length of command bytes */
     uint32_t            max_command_length;        /* command buffer size */
     off_t               cmd_offset;
     /* The response buffer is reused for each command. Thus it can grow but never shrink */
@@ -135,6 +135,14 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
     uint32_t            ack = htobe32(0);
     struct tpm2_resp_prefix respprefix;
     uint32_t            lastCommand;
+    uint32_t            frame_used = 0;
+    uint64_t            frame_generation = 0;
+    unsigned char       *effective = NULL, *outgoing;
+    const unsigned char *original_response;
+    uint32_t            effective_length = 0, outgoing_length;
+    bool                synthetic = false, backend_executed;
+    const char          *response_source;
+    bool                intercept_failed = false;
     enum TPMLIB_TPMProperty prop = (mlp->tpmversion == TPMLIB_TPM_VERSION_1_2)
         ? TPMPROP_TPM_BUFFER_MAX
         : TPMPROP_TPM2_BUFFER_MAX;
@@ -179,12 +187,18 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
                                   command, max_command_length);
         if (command_length > 0) {
             pcap_packet_record_write(&mlp->ps, command, command_length, true);
+            (void)lua_intercept_internal(mlp->lua, command, command_length, true, 0);
+            if (mlp->lua && (mlp->ps.failed || lua_intercept_failed(mlp->lua)))
+                goto intercept_error;
 
             mlp->lastCommand = tpmlib_get_cmd_ordinal(command, command_length);
             rc = TPMLIB_Process(&rbuffer, &rlength, &rTotal,
                                 command, command_length);
 
-            pcap_packet_record_write(&mlp->ps, rbuffer, rlength, false);
+            if (!rc)
+                pcap_packet_record_write(&mlp->ps, rbuffer, rlength, false);
+            (void)lua_intercept_internal(mlp->lua, rc ? NULL : rbuffer,
+                                    rc ? 0 : rlength, false, rc);
         }
 
         if (rc || command_length == 0) {
@@ -194,6 +208,9 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
         }
     }
 
+    if (mlp->lua && (mlp->ps.failed || lua_intercept_failed(mlp->lua) || rc))
+        goto intercept_error;
+
     while (!g_mainloop_terminate) {
 
         while (rc == 0) {
@@ -201,6 +218,7 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
                 if (connection_fd.fd != mlp->fd) {
                     SWTPM_IO_Disconnect(&connection_fd);
                     connection_fd.fd = mlp->fd;
+                    frame_used = 0;
                 }
             }
 
@@ -245,11 +263,15 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
 
             if (ready < 0 ||
                 (pollfds[NOTIFY_FD].revents & POLLIN) != 0) {
+                if (mlp->lua && (frame_used || ready < 0))
+                    goto intercept_error;
                 SWTPM_IO_Disconnect(&connection_fd);
+                if (mlp->flags & MAIN_LOOP_FLAG_USE_FD)
+                    mlp->fd = -1;
                 break;
             }
 
-            if (pollfds[DATA_CLIENT_FD].revents & (POLLHUP | POLLERR)) {
+            if (!mlp->lua && (pollfds[DATA_CLIENT_FD].revents & (POLLHUP | POLLERR))) {
                 logprintf(STDERR_FILENO, "Data client disconnected\n");
                 mlp->fd = -1;
                 /* chardev and unixio get this signal, not tcp */
@@ -277,6 +299,15 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
 
                 if (g_mainloop_terminate)
                     break;
+
+                if (mlp->lua && (mlp->ps.failed || lua_intercept_failed(mlp->lua)))
+                    goto intercept_error;
+                if (mlp->lua && frame_used &&
+                    frame_generation != mlp->initialization_generation) {
+                    /* Never splice a partial command across a TPM reset. */
+                    lua_intercept_fail(mlp->lua, "TPM initialized during a partial request");
+                    goto intercept_error;
+                }
             }
 
             if (pollfds[CTRL_CLIENT_FD].revents & POLLHUP) {
@@ -290,15 +321,52 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
                 }
             }
 
-            if (!(pollfds[DATA_CLIENT_FD].revents & POLLIN))
+            if (!(pollfds[DATA_CLIENT_FD].revents &
+                  (mlp->lua ? (POLLIN | POLLHUP | POLLERR | POLLNVAL) : POLLIN)))
                 continue;
 
-            /* before processing a command ensure that the storage is locked */
-            if ((g_mainloop_terminate = !mainloop_ensure_locked_storage(mlp)))
-                break;
-
             /* Read the command.  The number of bytes is determined by 'paramSize' in the stream */
-            if (rc == 0) {
+            if (mlp->lua) {
+                uint32_t limit = mlp->buffer_size ? mlp->buffer_size :
+                                  (uint32_t)tpmlib_get_tpm_property(prop);
+                int framed;
+
+                if (limit > max_command_length) {
+                    unsigned char *larger = realloc(command, limit);
+                    if (!larger)
+                        goto intercept_error;
+                    command = larger;
+                    max_command_length = limit;
+                }
+                if (!frame_used)
+                    frame_generation = mlp->initialization_generation;
+                framed = SWTPM_IO_ReadRawTPM2(connection_fd.fd, command, &frame_used, limit);
+                if (framed < 0) {
+                    lua_intercept_framing_error(mlp->lua, command, frame_used);
+                    goto intercept_error;
+                }
+                if (framed == 2) {
+                    SWTPM_IO_Disconnect(&connection_fd);
+                    if (mlp->flags & MAIN_LOOP_FLAG_USE_FD)
+                        mlp->fd = -1;
+                    if (mlp->flags & (MAIN_LOOP_FLAG_TERMINATE | MAIN_LOOP_FLAG_END_ON_HUP))
+                        g_mainloop_terminate = true;
+                    break;
+                }
+                if (framed == 0)
+                    continue;
+                command_length = frame_used;
+                frame_used = 0;
+                if (pcap_packet_record_write(&mlp->ps, command, command_length, true))
+                    goto intercept_error;
+                effective = command;
+                effective_length = command_length;
+                synthetic = false;
+                if (lua_intercept_request(mlp->lua, command, command_length,
+                                           g_locality, limit, &effective,
+                                           &effective_length, &synthetic))
+                    goto intercept_error;
+            } else if (rc == 0) {
                 rc = SWTPM_IO_Read(&connection_fd, command, &command_length,
                                    max_command_length, &mlp->ps);
                 if (rc != 0) {
@@ -309,7 +377,7 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
 
             cmd_offset = 0;
             /* Handle optional TCG Header in front of TPM 2 Command */
-            if (rc == 0 && mlp->tpmversion == TPMLIB_TPM_VERSION_2) {
+            if (rc == 0 && !mlp->lua && mlp->tpmversion == TPMLIB_TPM_VERSION_2) {
                 cmd_offset = tpmlib_handle_tcg_tpm2_cmd_header(command,
                                                                command_length,
                                                                &g_locality);
@@ -323,6 +391,24 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
                 }
             }
 
+            if (!mlp->lua) {
+                effective = &command[cmd_offset];
+                effective_length = command_length - cmd_offset;
+                synthetic = false;
+            }
+            backend_executed = false;
+            response_source = synthetic ? "lua" : "swtpm";
+            if (synthetic)
+                goto skip_process;
+
+            /* Synthetic replies need no backend or storage access. */
+            if (rc == 0 && !mainloop_ensure_locked_storage(mlp)) {
+                if (mlp->lua)
+                    goto intercept_error;
+                g_mainloop_terminate = true;
+                break;
+            }
+
             if (rc == 0) {
                 if (!tpm_running) {
                     tpmlib_write_fatal_error_response(&rbuffer, &rlength,
@@ -333,20 +419,12 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
             }
 
             if (rc == 0) {
-                lastCommand =
-                    tpmlib_get_cmd_ordinal(&command[cmd_offset],
-                                           command_length - cmd_offset);
-                if (lastCommand != TPM_ORDINAL_NONE)
-                    mlp->lastCommand = lastCommand;
-            }
-
-            if (rc == 0) {
                 rlength = 0;                                /* clear the response buffer */
                 rc = tpmlib_process(&rbuffer,
                                     &rlength,
                                     &rTotal,
-                                    &command[cmd_offset],
-                                    command_length - cmd_offset,
+                                    effective,
+                                    effective_length,
                                     mlp->locality_flags,
                                     &g_locality,
                                     mlp->tpmversion);
@@ -355,23 +433,47 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
             }
 
             if (rc == 0) {
+                if (lua_intercept_backend(mlp->lua, effective, effective_length, true))
+                    goto intercept_error;
+                lastCommand = tpmlib_get_cmd_ordinal(effective, effective_length);
+                if (lastCommand != TPM_ORDINAL_NONE)
+                    mlp->lastCommand = lastCommand;
+                backend_executed = true;
+                response_source = "tpm";
                 rlength = 0;                                /* clear the response buffer */
                 rc = TPMLIB_Process(&rbuffer,
                                     &rlength,
                                     &rTotal,
-                                    &command[cmd_offset],
-                                    command_length - cmd_offset);
+                                    effective,
+                                    effective_length);
+                lua_intercept_processed(mlp->lua, rc);
+                if (rc == 0 && lua_intercept_backend(mlp->lua, rbuffer, rlength, false))
+                    goto intercept_error;
             }
 
 skip_process:
+            if (mlp->lua && (rc || lua_intercept_failed(mlp->lua)))
+                goto intercept_error;
             /* write the results */
             if (rc == 0) {
-                respprefix.size = htobe32(rlength);
-                iov[1].iov_base = rbuffer;
-                iov[1].iov_len  = rlength;
+                outgoing_length = rlength;
+                original_response = synthetic ?
+                    lua_intercept_synthetic(mlp->lua, &outgoing_length) : rbuffer;
+                if (mlp->lua && (!original_response || outgoing_length < 10))
+                    goto intercept_error;
+                outgoing = (unsigned char *)original_response;
+                if (lua_intercept_response(mlp->lua, original_response, outgoing_length,
+                                            backend_executed, response_source,
+                                            &outgoing, &outgoing_length))
+                    goto intercept_error;
+                respprefix.size = htobe32(outgoing_length);
+                iov[1].iov_base = outgoing;
+                iov[1].iov_len  = outgoing_length;
 
-                SWTPM_IO_Write(&connection_fd, iov, ARRAY_LEN(iov),
-                               &mlp->ps);
+                rc = SWTPM_IO_Write(&connection_fd, iov, ARRAY_LEN(iov), &mlp->ps);
+                lua_intercept_complete(mlp->lua, rc);
+                if (mlp->lua && (rc || mlp->ps.failed || lua_intercept_failed(mlp->lua)))
+                    goto intercept_error;
             }
 
             if (!(mlp->flags & MAIN_LOOP_FLAG_KEEP_CONNECTION)) {
@@ -387,9 +489,22 @@ skip_process:
             break;
     }
 
+    if (mlp->lua && frame_used)
+        goto intercept_error;
+    goto shutdown;
+
+intercept_error:
+    intercept_failed = true;
+    lua_intercept_fail(mlp->lua, "transport, processing or capture failure");
+    lua_intercept_complete(mlp->lua, rc ? rc : TPM_FAIL);
+
+shutdown:
     if (tpm_running && !mlp->disable_auto_shutdown)
         tpmlib_maybe_send_tpm2_shutdown(mlp->tpmversion, &mlp->lastCommand,
-                                        &mlp->ps);
+                                        &mlp->ps, mlp->lua);
+
+    if (mlp->lua && (intercept_failed || mlp->ps.failed || lua_intercept_failed(mlp->lua)))
+        rc = TPM_FAIL;
 
     free(rbuffer);
     free(command);

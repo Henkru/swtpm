@@ -77,6 +77,43 @@
 
 static int      sock_fd = -1;
 
+int SWTPM_IO_ReadRawTPM2(int fd, unsigned char *buffer, uint32_t *used,
+                        uint32_t limit)
+{
+    uint32_t size = 10;
+    ssize_t n;
+
+    if (limit < 10 || *used > limit)
+        return -1;
+    if (*used >= 10) {
+        memcpy(&size, buffer + 2, sizeof(size));
+        size = be32toh(size);
+        if (size < 10 || size > limit || *used > size)
+            return -1;
+    }
+    if (*used < size) {
+        n = recv(fd, buffer + *used, size - *used, MSG_DONTWAIT);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            return 0;
+        if (n == 0)
+            return *used ? -1 : 2;
+        if (n < 0)
+            return -1;
+        *used += n;
+    }
+    if (*used < 10)
+        return 0;
+    /* Reject the optional TCG prefix. Other tags are backend input: firmware
+     * can probe TPM 1.2 commands even when using a TPM 2 backend. */
+    if (buffer[0] == 0 && buffer[1] == 0 && buffer[2] == 0 && buffer[3] == 8)
+        return -1;
+    memcpy(&size, buffer + 2, sizeof(size));
+    size = be32toh(size);
+    if (size < 10 || size > limit)
+        return -1;
+    return *used == size ? 1 : 0;
+}
+
 
 /* SWTPM_IO_Read() reads a TPM command packet from the host
 
@@ -227,7 +264,9 @@ TPM_RESULT SWTPM_IO_Write(TPM_CONNECTION_FD *connection_fd,       /* read/write 
     SWTPM_PrintAll(" SWTPM_IO_Write:", " ",
                    iovec[1].iov_base, iovec[1].iov_len);
 
-    pcap_packet_record_write(ps, iovec[1].iov_base, iovec[1].iov_len, false);
+    if (pcap_packet_record_write(ps, iovec[1].iov_base, iovec[1].iov_len, false) &&
+        ps->strict)
+        return TPM_IOERROR;
 
     /* test that connection is open to write */
     if (connection_fd->fd < 0) {

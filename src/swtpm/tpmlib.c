@@ -682,7 +682,8 @@ uint32_t tpmlib_create_startup_cmd(uint16_t startupType,
  */
 void tpmlib_maybe_send_tpm2_shutdown(TPMLIB_TPMVersion tpmversion,
                                      uint32_t *lastCommand,
-                                     struct pcap_state *ps)
+                                     struct pcap_state *ps,
+                                     struct lua_intercept *lua)
 {
     TPM_RESULT res;
     unsigned char *rbuffer = NULL;
@@ -724,12 +725,19 @@ void tpmlib_maybe_send_tpm2_shutdown(TPMLIB_TPMVersion tpmversion,
 #endif
         tpm2_shutdown.shutdownType = htobe16(shutdownTypes[i]);
         pcap_packet_record_write(ps, &tpm2_shutdown, sizeof(tpm2_shutdown), true);
+        if (lua_intercept_internal(lua, &tpm2_shutdown, sizeof(tpm2_shutdown), true, 0) ||
+            (lua && ps->failed))
+            break;
 
         res = TPMLIB_Process(&rbuffer, &rlength, &rTotal,
                              (unsigned char *)&tpm2_shutdown,
                              sizeof(tpm2_shutdown));
 
-        pcap_packet_record_write(ps, rbuffer, rlength, false);
+        if (!res)
+            pcap_packet_record_write(ps, rbuffer, rlength, false);
+        if (lua_intercept_internal(lua, res ? NULL : rbuffer, res ? 0 : rlength, false, res) ||
+            (lua && ps->failed))
+            break;
 
         if (res || rlength < sizeof(struct tpm_resp_header))
             continue;

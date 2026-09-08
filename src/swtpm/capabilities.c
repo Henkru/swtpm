@@ -231,7 +231,7 @@ int print_profiles(void)
     return 0;
 }
 
-int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion)
+int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion, bool socket)
 {
     char *string = NULL;
     int ret = -1;
@@ -248,6 +248,13 @@ int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion)
     const char *nvram_backend_file = "\"nvram-backend-file\"";
     g_autofree gchar *profiles = NULL;
     bool is_tpm2 = tpmversion == TPMLIB_TPM_VERSION_2;
+    const char *lua_caps = "";
+#ifdef WITH_LUA
+    if (socket && is_tpm2)
+        lua_caps = ", \"cmdarg-lua\", \"lua-api-1\"";
+#else
+    (void)socket;
+#endif
 
     /* ignore errors */
     TPMLIB_ChooseTPMVersion(tpmversion);
@@ -271,7 +278,7 @@ int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion)
          "{ "
          "\"type\": \"swtpm\", "
          "\"features\": [ "
-             "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s"
+             "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s"
           " ], "
          "\"profiles\": { %s}, "
          "\"version\": \"" VERSION "\" "
@@ -300,6 +307,7 @@ int capabilities_print_json(bool cusetpm, TPMLIB_TPMVersion tpmversion)
          true         ? ", \"tpmstate-dir-backend-opt-fsync\""     : "",
          true         ? ", \"cmdarg-pcap\""            : "",
          true         ? ", \"systemd-notify\""         : "",
+         lua_caps,
          profiles     ? profiles                       : ""
     );
 

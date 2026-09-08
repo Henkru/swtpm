@@ -613,7 +613,7 @@ int ctrlchannel_process_fd(int fd,
 
         if (*tpm_running && !mlp->disable_auto_shutdown)
             tpmlib_maybe_send_tpm2_shutdown(mlp->tpmversion,
-                                            &mlp->lastCommand, &mlp->ps);
+                                            &mlp->lastCommand, &mlp->ps, mlp->lua);
 
         init_p = (ptm_init *)input.body;
 
@@ -631,6 +631,9 @@ int ctrlchannel_process_fd(int fd,
                       "Error: Could not initialize the TPM\n");
         } else {
             *tpm_running = true;
+            mlp->initialization_generation++;
+            mlp->lastCommand = TPM_ORDINAL_NONE;
+            lua_intercept_initialized(mlp->lua);
             SWTPM_G_FREE(mlp->json_profile);
         }
 
@@ -645,7 +648,7 @@ int ctrlchannel_process_fd(int fd,
         if (*tpm_running && !mlp->disable_auto_shutdown)
             tpmlib_maybe_send_tpm2_shutdown(mlp->tpmversion,
                                             &mlp->lastCommand,
-                                            &mlp->ps);
+                                            &mlp->ps, mlp->lua);
 
         TPMLIB_Terminate();
 
@@ -662,7 +665,7 @@ int ctrlchannel_process_fd(int fd,
         if (*tpm_running && !mlp->disable_auto_shutdown)
             tpmlib_maybe_send_tpm2_shutdown(mlp->tpmversion,
                                             &mlp->lastCommand,
-                                            &mlp->ps);
+                                            &mlp->ps, mlp->lua);
 
         TPMLIB_Terminate();
 
@@ -902,6 +905,7 @@ int ctrlchannel_process_fd(int fd,
         psbs = (ptm_setbuffersize *)&output.body;
         out_len = sizeof(psbs->u.resp);
 
+        mlp->buffer_size = buffersize;
         psbs->u.resp.buffersize = htobe32(buffersize);
         psbs->u.resp.minsize = htobe32(minsize);
         psbs->u.resp.maxsize = htobe32(maxsize);

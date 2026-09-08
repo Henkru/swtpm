@@ -92,5 +92,6 @@ bool option_get_bool(OptionValues *ovs, const char *name, bool def);
 mode_t option_get_mode_t(OptionValues *ovs, const char *name, mode_t def);
 uid_t option_get_uid_t(OptionValues *ovs, const char *name, uid_t def);
 gid_t option_get_gid_t(OptionValues *ovs, const char *name, gid_t def);
+int option_parse_fd(const char *value);
 
 #endif /* _SWTPM_OPTIONS_H */

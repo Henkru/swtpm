@@ -44,6 +44,7 @@
 #define _SWTPM_MAINLOOP_H_
 
 #include "pcap.h"
+#include "lua_intercept.h"
 
 #include <libtpms/tpm_library.h>
 
@@ -78,6 +79,9 @@ struct mainLoopParams {
     char *json_profile;
     /* PCAP state */
     struct pcap_state ps;
+    struct lua_intercept *lua;
+    uint64_t initialization_generation;
+    uint32_t buffer_size; /* negotiated via CMD_SET_BUFFERSIZE, zero = default */
 };
 
 int mainLoop(struct mainLoopParams *mlp,

@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""Exercise the public Lua/socket boundary against real libtpms, no mock TPM."""
+import array
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import signal
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+import unittest
+
+
+SWTPM = os.environ.get("SWTPM", str(Path(os.environ.get("abs_top_builddir", ".")) /
+                                  "src/swtpm/swtpm"))
+PASS = "return {api_version=1,on_request=function() end,on_response=function() end}"
+
+
+def packet(code, body=b"", tag=0x8001):
+    return struct.pack(">HII", tag, 10 + len(body), code) + body
+
+
+STARTUP = packet(0x144, b"\0\0")
+RANDOM = packet(0x17B, b"\0\x10")
+CAPABILITY = packet(0x17A, struct.pack(">III", 6, 0x100, 1))
+PCR_READ = packet(0x17E, struct.pack(">IHB", 1, 0xB, 3) + b"\0\0\1")
+PCR_EXTEND = packet(0x182, struct.pack(">II", 16, 9) +
+                    bytes.fromhex("400000090000000000") +
+                    struct.pack(">IH", 1, 0xB) + b"\x01" * 32, 0x8002)
+
+
+def recv_exact(sock, count):
+    data = b""
+    while len(data) < count:
+        more = sock.recv(count - len(data))
+        if not more:
+            raise EOFError(data)
+        data += more
+    return data
+
+
+def receive(sock):
+    header = recv_exact(sock, 10)
+    size = struct.unpack_from(">I", header, 2)[0]
+    if not 10 <= size <= 65536:
+        raise AssertionError(size)
+    return header + recv_exact(sock, size - 10)
+
+
+def capture(path):
+    """Decode the native pcapng Ethernet/IPv4/TCP payloads independently."""
+    data = Path(path).read_bytes()
+    result = []
+    offset = 0
+    while offset < len(data):
+        kind, length = struct.unpack_from("=II", data, offset)
+        assert length >= 12 and length % 4 == 0
+        assert struct.unpack_from("=I", data, offset + length - 4)[0] == length
+        if kind == 6:
+            size = struct.unpack_from("=I", data, offset + 20)[0]
+            frame = data[offset + 28:offset + 28 + size]
+            ip_size = (frame[14] & 15) * 4
+            tcp = 14 + ip_size
+            tcp_size = (frame[tcp + 12] >> 4) * 4
+            payload = frame[tcp + tcp_size:]
+            if payload:
+                dest = struct.unpack_from(">H", frame, tcp + 2)[0]
+                result.append((dest == 2321, payload))
+        offset += length
+    assert offset == len(data)
+    return result
+
+
+class TPM:
+    def __init__(self, script=PASS, *, initialize=True, auto_shutdown=False,
+                 passed_fd=False, script_fd=False, args=(), log_path=None,
+                 backend_path=None, file_limit=None, direct_server=False,
+                 native_path=None):
+        self.tmp = tempfile.TemporaryDirectory(prefix="swtpm-lua-")
+        self.path = Path(self.tmp.name)
+        self.script = script
+        source = self.path / "attack, with spaces.lua"
+        source.write_text(script or "")
+        self.client, data = socket.socketpair()
+        self.control, control = socket.socketpair()
+        self.client.settimeout(5)
+        self.control.settimeout(5)
+        self.error = open(self.path / "stderr", "wb")
+        self.log = open(log_path or self.path / "intercept.jsonl", "wb")
+        self.backend = open(backend_path or self.path / "backend.pcapng", "wb")
+        self.source = open(source, "rb")
+        fds = [control.fileno()]
+        cmd = [SWTPM, "socket", "--tpm2", "--tpmstate", "dir=" + str(self.path),
+               "--ctrl", "type=unixio,clientfd=" + str(control.fileno()),
+               "--pcap", "file=" + str(native_path or self.path / "native.pcapng")]
+        if direct_server:
+            cmd += ["--server", "type=unixio,path=" + str(self.path / "data.sock")]
+        elif not passed_fd:
+            fds.append(data.fileno())
+            cmd += ["--fd", str(data.fileno())]
+        flags = []
+        if initialize:
+            flags += ["not-need-init"]
+        if not auto_shutdown:
+            flags += ["disable-auto-shutdown"]
+        if flags:
+            cmd += ["--flags", ",".join(flags)]
+        if script is not None:
+            fds += [self.log.fileno(), self.backend.fileno()]
+            cmd += ["--lua-log-fd", str(self.log.fileno()),
+                    "--lua-pcap-fd", str(self.backend.fileno())]
+            if script_fd:
+                fds.append(self.source.fileno())
+                cmd += ["--lua-script-fd", str(self.source.fileno())]
+            else:
+                cmd += ["--lua-script", str(source)]
+        def limit_files():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+
+        self.process = subprocess.Popen(cmd + list(args), pass_fds=fds,
+                                        preexec_fn=limit_files if file_limit else None,
+                                        stdout=self.error, stderr=self.error)
+        control.close()
+        if direct_server:
+            self.client.close()
+            self.client = socket.socket(socket.AF_UNIX)
+            self.client.settimeout(5)
+            deadline = time.monotonic() + 5
+            while not (self.path / "data.sock").exists():
+                if self.process.poll() is not None or time.monotonic() > deadline:
+                    raise RuntimeError("direct socket did not become ready")
+                time.sleep(0.01)
+            self.client.connect(str(self.path / "data.sock"))
+        if passed_fd:
+            self.control.sendmsg([struct.pack(">I", 0x10)],
+                                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                   array.array("i", [data.fileno()]))])
+            assert recv_exact(self.control, 4) == b"\0" * 4
+        data.close()
+
+    def command(self, command):
+        self.client.sendall(command)
+        return receive(self.client)
+
+    def ctrl(self, code, body=b"", length=4):
+        self.control.sendall(struct.pack(">I", code) + body)
+        return recv_exact(self.control, length)
+
+    def stop(self, failure=False):
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGTERM)
+        rc = self.process.wait(timeout=5)
+        self.error.flush()
+        diagnostic = (self.path / "stderr").read_text(errors="replace")
+        if failure:
+            assert rc != 0, diagnostic
+        else:
+            assert rc == 0, diagnostic
+        return self.records()
+
+    def records(self):
+        return [json.loads(line) for line in (self.path / "intercept.jsonl").read_text().splitlines()]
+
+    def close(self):
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        self.client.close()
+        self.control.close()
+        for fd in (self.error, self.log, self.backend, self.source):
+            fd.close()
+        self.tmp.cleanup()
+
+
+class InterceptionTests(unittest.TestCase):
+    def tpm(self, *args, **kwargs):
+        tpm = TPM(*args, **kwargs)
+        self.addCleanup(tpm.close)
+        return tpm
+
+    def test_pass_and_capture(self):
+        for script in (None, PASS):
+            tpm = self.tpm(script)
+            observed = []
+            for command in (STARTUP, CAPABILITY, RANDOM, RANDOM):
+                response = tpm.command(command)
+                self.assertEqual(response[6:10], b"\0" * 4)
+                observed += [(True, command), (False, response)]
+            records = tpm.stop()
+            self.assertEqual(capture(tpm.path / "native.pcapng"), observed)
+            if script:
+                self.assertEqual(capture(tpm.path / "backend.pcapng"), observed)
+                self.assertEqual(records[0]["script_sha256"], hashlib.sha256(script.encode()).hexdigest())
+                self.assertEqual(bytes.fromhex(records[1]["hex"]), script.encode())
+                stages = [r for r in records if r.get("origin") == "external" and r["stage"] != "processing"]
+                self.assertEqual([r["id"] for r in stages], [i for i in range(1, 5) for _ in range(5)])
+                for i in range(4):
+                    self.assertEqual(bytes.fromhex(stages[i * 5]["hex"]), observed[i * 2][1])
+                    self.assertEqual(bytes.fromhex(stages[i * 5 + 3]["hex"]), observed[i * 2 + 1][1])
+                self.assertFalse(records[-1]["failed"])
+
+    def test_direct_server_and_snapshot(self):
+        tpm = self.tpm(direct_server=True)
+        self.assertEqual(tpm.command(STARTUP), packet(0))
+        (tpm.path / "attack, with spaces.lua").write_text("error('changed after loading')")
+        self.assertEqual(tpm.command(RANDOM)[6:10], b"\0" * 4)
+        records = tpm.stop()
+        self.assertEqual(bytes.fromhex(records[1]["hex"]), PASS.encode())
+
+    def test_many_exchanges_release_state(self):
+        # Retaining these tables would exceed the 16 MiB Lua budget.
+        script = '''return {api_version=1,
+on_request=function(ctx) ctx.state.payload=string.rep("x",100000) end,
+on_response=function(ctx) assert(#ctx.state.payload==100000) end}'''
+        tpm = self.tpm(script)
+        tpm.command(STARTUP)
+        for _ in range(200):
+            tpm.command(RANDOM)
+        self.assertEqual(tpm.stop()[-1]["completed"], 201)
+
+    def test_cli_rejections_and_artifact_aliases(self):
+        for frontend in ("socket", "chardev"):
+            result = subprocess.run([SWTPM, frontend, "--lua-script", "unused.lua"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+        for args in (("--lua-script", "duplicate.lua"), ("--lua-log-fd", "-3")):
+            tpm = self.tpm(args=args)
+            self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+        with tempfile.TemporaryDirectory(prefix="swtpm-alias-") as tmp:
+            alias = Path(tmp) / "alias"
+            for kwargs in ({"log_path": alias, "backend_path": alias},
+                           {"native_path": alias, "backend_path": alias}):
+                tpm = self.tpm(**kwargs)
+                self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+
+    def test_fragmentation_coalescing_and_control(self):
+        tpm = self.tpm()
+        for part in (STARTUP[:1], STARTUP[1:7], STARTUP[7:10], STARTUP[10:11]):
+            tpm.client.sendall(part)
+            # The control loop remains responsive with an incomplete data frame.
+            self.assertEqual(tpm.ctrl(5, b"\0"), b"\0" * 4)
+        tpm.client.sendall(STARTUP[11:] + CAPABILITY + RANDOM)
+        for _ in range(3):
+            self.assertEqual(receive(tpm.client)[6:10], b"\0" * 4)
+        records = tpm.stop()
+        self.assertEqual(records[-1]["exchanges"], 3)
+
+    def test_state_and_replacement(self):
+        script = '''
+local seen = 0
+return {api_version=1,
+on_request=function(ctx, bytes)
+  assert(io == nil and os == nil and package == nil and debug == nil)
+  assert(load == nil and pcall == nil and setmetatable == nil)
+  assert(ctx.original_request == bytes)
+  seen = seen + 1
+  assert(ctx.id == seen)
+  ctx.state.id = ctx.id
+  ctx.state.code = ctx.command_code
+  ctx.state = {broken=true}
+  ctx.id = -1
+  if ctx.command_code == 0x17b and seen % 2 == 0 then
+    return {action="replace", bytes=bytes:sub(1,10)..string.pack(">I2",8)}
+  end
+end,
+on_response=function(ctx, bytes)
+  assert(ctx.state.id == ctx.id and ctx.state.code == ctx.command_code)
+  assert(ctx.state.broken == nil and ctx.backend_executed)
+  if ctx.command_code == 0x17b and ctx.id % 2 == 0 then
+    assert(#bytes == 20 and #ctx.effective_request == 12)
+    return {action="replace", bytes=bytes:sub(1,12)..string.rep("\\0",8)}
+  end
+end}
+'''
+        tpm = self.tpm(script, script_fd=True)
+        tpm.command(STARTUP)
+        for i in range(4):
+            response = tpm.command(RANDOM)
+            self.assertEqual(len(response), 20 if i % 2 == 0 else 28)
+            if i % 2 == 0:
+                self.assertEqual(response[12:], b"\0" * 8)
+        records = tpm.stop()
+        original = [r for r in records if r["stage"] == "original_request"]
+        self.assertEqual([r["id"] for r in original], list(range(1, 6)))
+        backend = capture(tpm.path / "backend.pcapng")
+        self.assertEqual(backend[2][1][-2:], b"\0\x08")
+        self.assertNotEqual(backend[3][1][-8:], b"\0" * 8)
+
+    def test_changed_command_and_message_sizes(self):
+        script = '''return {api_version=1,
+on_request=function(ctx, bytes)
+  if ctx.command_code == 0x17b then
+    return {action="replace", bytes=string.pack(">I2I4I4I4I4I4",0x8001,22,0x17a,6,0x100,1)}
+  end
+end,
+on_response=function(ctx, bytes)
+  if ctx.command_code == 0x17b then
+    assert(ctx.effective_command_code == 0x17a and #ctx.effective_request == 22)
+    assert(#bytes > 10 and ctx.response_source == "tpm")
+    return {action="replace", bytes=string.pack(">I2I4I4",0x8001,10,0x101)}
+  end
+end}'''
+        tpm = self.tpm(script)
+        tpm.command(STARTUP)
+        self.assertEqual(tpm.command(RANDOM), packet(0x101))
+        tpm.stop()
+        backend = capture(tpm.path / "backend.pcapng")
+        self.assertEqual(backend[2], (True, CAPABILITY))
+        self.assertEqual(backend[3][1][6:10], b"\0" * 4)
+
+    def test_synthetic_suppresses_pcr_extend(self):
+        script = '''return {api_version=1,
+on_request=function(ctx, bytes)
+  if ctx.command_code == 0x182 then
+    ctx.state.synthetic = ctx.id
+    return {action="respond",bytes=string.pack(">I2I4I4I4I2I1I2",0x8002,19,0,0,0,0,0)}
+  end
+end,
+on_response=function(ctx, bytes)
+  if ctx.state.synthetic then
+    assert(ctx.state.synthetic == ctx.id and ctx.response_source == "lua")
+    assert(not ctx.backend_executed and ctx.effective_request == nil)
+    assert(ctx.effective_command_code == nil)
+  end
+end}'''
+        for enabled in (False, True):
+            tpm = self.tpm(script if enabled else PASS)
+            tpm.command(STARTUP)
+            before = tpm.command(PCR_READ)
+            self.assertEqual(before[6:10], b"\0" * 4)
+            self.assertEqual(tpm.command(PCR_EXTEND)[6:10], b"\0" * 4)
+            after = tpm.command(PCR_READ)
+            self.assertEqual(after[-32:], before[-32:] if enabled else
+                             hashlib.sha256(before[-32:] + b"\1" * 32).digest())
+            records = tpm.stop()
+            self.assertEqual(records[-1]["backend_exchanges"], 3 if enabled else 4)
+
+    def test_preinit_synthetic_and_swtpm_errors(self):
+        script = '''return {api_version=1,
+on_request=function(ctx, bytes)
+  if ctx.command_code == 0x17b then
+    ctx.state.synthetic = true
+    return {action="respond", bytes=string.pack(">I2I4I4",0x8001,10,0x100)}
+  end
+end,
+on_response=function(ctx, bytes)
+  assert(ctx.generation == 0 and not ctx.backend_executed)
+  assert(ctx.response_source == (ctx.state.synthetic and "lua" or "swtpm"))
+end}'''
+        tpm = self.tpm(script, initialize=False)
+        self.assertEqual(tpm.command(RANDOM), packet(0x100))
+        self.assertNotEqual(tpm.command(STARTUP)[6:10], b"\0" * 4)
+        records = tpm.stop()
+        self.assertEqual(records[-1]["backend_exchanges"], 0)
+        self.assertEqual(capture(tpm.path / "backend.pcapng"), [])
+
+    def test_datafd_generation_and_negotiation(self):
+        script = '''local count=0
+return {api_version=1,on_request=function(ctx, bytes)
+  count=count+1
+  assert(ctx.id==count and ctx.generation==count)
+  assert(ctx.locality==3)
+end}'''
+        tpm = self.tpm(script, initialize=False, passed_fd=True)
+        response = tpm.ctrl(0x11, struct.pack(">I", 1024), 16)
+        self.assertEqual(response[:4], b"\0" * 4)
+        self.assertEqual(tpm.ctrl(5, b"\3"), b"\0" * 4)
+        for _ in range(2):
+            self.assertEqual(tpm.ctrl(2, b"\0" * 4), b"\0" * 4)
+            tpm.command(STARTUP)
+        tpm.stop()
+
+    def test_negotiated_replacement_limit(self):
+        script = '''return {api_version=1,on_request=function(ctx, bytes)
+local n=string.unpack(">I2",bytes,11)
+return {action="respond",bytes=string.pack(">I2I4I4",0x8001,n,0)..string.rep("x",n-10)}
+end}'''
+        tpm = self.tpm(script, initialize=False)
+        response = tpm.ctrl(0x11, struct.pack(">I", 1024), 16)
+        negotiated = struct.unpack_from(">I", response, 4)[0]
+        self.assertGreaterEqual(negotiated, 1024)
+        tpm.client.sendall(packet(0x17b, struct.pack(">H", negotiated + 1)))
+        self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+
+    def test_shutdown_bookkeeping(self):
+        for action, replacement in (("respond", packet(0)), ("replace", RANDOM)):
+            script = '''return {api_version=1,on_request=function(ctx,bytes)
+if ctx.command_code==0x145 then return {action="%s",bytes=string.char(%s)} end
+end}''' % (action, ",".join(map(str, replacement)))
+            tpm = self.tpm(script, auto_shutdown=True)
+            tpm.command(STARTUP)
+            tpm.command(packet(0x145, b"\0\0"))
+            records = tpm.stop()
+            internal = [r for r in records if r.get("origin") == "internal" and r["stage"] == "request"]
+            self.assertTrue(internal)
+            self.assertEqual(bytes.fromhex(internal[-1]["hex"])[6:10], struct.pack(">I", 0x145))
+
+    def test_script_failures(self):
+        scripts = [
+            "syntax error !", "return {}", "return {api_version=2,on_request=function() end}",
+            "return {api_version=1,on_requset=function() end}",
+            "while true do end", "local x=string.rep('x',17000000); " + PASS,
+        ]
+        for script in scripts:
+            with self.subTest(script=script):
+                tpm = self.tpm(script)
+                self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+                self.assertTrue(tpm.records()[-1]["failed"])
+
+    def test_callback_failures(self):
+        bodies = [
+            "error('callback boom')", "error({})", "while true do end",
+            "local x=string.rep('x',17000000)", "return false",
+            "return {action='drop'}", "return {action='replace',bytes=123}",
+            "return {action='replace',bytes='short'}",
+            "return {action='replace',bytes=string.pack('>I2I4I4',0x8001,11,0)}",
+            "return {action='replace',bytes=string.pack('>I2I4I4',0x8000,10,0)}",
+            "return {action='pass\\0evil'}", "tpm.log(string.rep('x',4097))",
+        ]
+        for body in bodies:
+            for callback in ("on_request", "on_response"):
+                with self.subTest(body=body, callback=callback):
+                    tpm = self.tpm("return {api_version=1,%s=function() %s end}" % (callback, body))
+                    tpm.client.sendall(STARTUP)
+                    self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+                    records = tpm.records()
+                    self.assertTrue(records[-1]["failed"])
+                    self.assertEqual(records[-1]["completed"], 1)
+
+    def test_invalid_framing_eof_and_termination(self):
+        for request in (bytes.fromhex("00000008000000000c80"), struct.pack(">HII", 0x8001, 9, 0),
+                        struct.pack(">HII", 0x8001, 0xFFFFFFFF, 0), STARTUP[:7], STARTUP[:11]):
+            with self.subTest(request=request):
+                tpm = self.tpm()
+                tpm.client.sendall(request)
+                tpm.client.shutdown(socket.SHUT_WR)
+                self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+        tpm = self.tpm()
+        tpm.client.sendall(STARTUP[:7])
+        tpm.ctrl(5, b"\0")
+        tpm.stop(failure=True)
+
+    def test_delivery_and_capture_failures(self):
+        tpm = self.tpm()
+        tpm.client.sendall(STARTUP)
+        tpm.client.shutdown(socket.SHUT_RD)
+        self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+        self.assertTrue(tpm.records()[-1]["failed"])
+        for which in ("log_path", "backend_path"):
+            tpm = self.tpm(**{which: "/dev/full"})
+            self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+
+    def test_midrun_log_and_native_capture_failure(self):
+        # A real file-size error after successful initialization, with SIGXFSZ
+        # ignored so swtpm has to propagate write(2)'s failure itself.
+        tpm = self.tpm(file_limit=4096)
+        tpm.client.sendall(packet(0x17b, b"x" * 2986))
+        self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+        self.assertIn("cannot write event log", (tpm.path / "stderr").read_text())
+        tpm = self.tpm(native_path="/dev/full")
+        self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+
+    def test_init_aborts_partial_frame(self):
+        tpm = self.tpm()
+        tpm.client.sendall(STARTUP[:7])
+        # Allow acceptance of the fragment, then service a control reset.
+        time.sleep(0.05)
+        tpm.ctrl(2, b"\0" * 4)
+        self.assertNotEqual(tpm.process.wait(timeout=5), 0)
+
+    def test_legacy_version_probe_on_tpm2(self):
+        tpm = self.tpm('''return {api_version=1,on_response=function(ctx, bytes)
+return {action="replace",bytes=bytes} end}''')
+        request = packet(0xf1, tag=0x00c1)
+        response = tpm.command(request)
+        self.assertNotEqual(response[6:10], b"\0" * 4)
+        tpm.command(STARTUP)
+        tpm.stop()
+        self.assertIn((True, request), capture(tpm.path / "backend.pcapng"))
+
+
+if __name__ == "__main__":
+    caps = subprocess.check_output([SWTPM, "socket", "--tpm2", "--print-capabilities"], text=True)
+    if "cmdarg-lua" not in json.loads(caps)["features"]:
+        print("SKIP: Lua support disabled")
+        raise SystemExit(77)
+    unittest.main()
