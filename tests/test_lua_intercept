@@ -2,6 +2,7 @@
 """Exercise the public Lua/socket boundary against real libtpms, no mock TPM."""
 import array
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,46 @@ import unittest
 SWTPM = os.environ.get("SWTPM", str(Path(os.environ.get("abs_top_builddir", ".")) /
                                   "src/swtpm/swtpm"))
 PASS = "return {api_version=1,on_request=function() end,on_response=function() end}"
+CRYPTO = json.loads((Path(__file__).resolve().parent / "data/lua-crypto.json").read_text())
+
+
+def lua_bytes(data):
+    return '"' + ''.join('\\x%02x' % byte for byte in data) + '"'
+
+
+def mgf1(seed, length):
+    return b"".join(hashlib.sha256(seed + struct.pack(">I", i)).digest()
+                    for i in range((length + 31) // 32))[:length]
+
+
+def xor_bytes(left, right):
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def oaep_encrypt(plaintext, label):
+    """Independent, deterministic test-only RSA/OAEP encoding (RFC 8017)."""
+    seed = bytes.fromhex(CRYPTO["seed"])
+    db = hashlib.sha256(label).digest() + b"\0" * (190 - len(plaintext)) + b"\1" + plaintext
+    masked_db = xor_bytes(db, mgf1(seed, 223))
+    encoded = b"\0" + xor_bytes(seed, mgf1(masked_db, 32)) + masked_db
+    return pow(int.from_bytes(encoded, "big"), CRYPTO["exponent"],
+               int(CRYPTO["modulus"], 16)).to_bytes(256, "big")
+
+
+def oaep_decrypt(ciphertext, label):
+    """Decode without using the OpenSSL implementation under test."""
+    assert len(ciphertext) == 256
+    n = int(CRYPTO["modulus"], 16)
+    assert int.from_bytes(ciphertext, "big") < n
+    encoded = pow(int.from_bytes(ciphertext, "big"),
+                  int(CRYPTO["private_exponent"], 16), n).to_bytes(256, "big")
+    assert encoded[0] == 0
+    seed = xor_bytes(encoded[1:33], mgf1(encoded[33:], 32))
+    db = xor_bytes(encoded[33:], mgf1(seed, 223))
+    assert db[:32] == hashlib.sha256(label).digest()
+    padding, plaintext = db[32:].split(b"\1", 1)
+    assert padding == b"\0" * len(padding)
+    return plaintext
 
 
 def packet(code, body=b"", tag=0x8001):
@@ -182,6 +223,221 @@ class InterceptionTests(unittest.TestCase):
         tpm = TPM(*args, **kwargs)
         self.addCleanup(tpm.close)
         return tpm
+
+    def crypto_script(self, body, callback="on_request", **bindings):
+        prefix = "\n".join("local %s = %s" % (name, lua_bytes(value))
+                           for name, value in bindings.items())
+        return prefix + "\nreturn {api_version=1,%s=function()\n%s\nend}" % (callback, body)
+
+    def crypto_success(self, body, callback="on_request", **bindings):
+        tpm = self.tpm(self.crypto_script(body, callback, **bindings))
+        self.assertEqual(tpm.command(STARTUP), packet(0))
+        return tpm.stop()
+
+    def crypto_failure(self, body, **bindings):
+        tpm = TPM(self.crypto_script(body, **bindings))
+        try:
+            tpm.client.sendall(STARTUP)
+            # A signal/crash is not an acceptable Lua error.
+            self.assertGreater(tpm.process.wait(timeout=5), 0)
+            records = tpm.records()
+            self.assertTrue(records[-1]["failed"])
+            errors = [r for r in records if r["stage"] == "error" and r["origin"] == "external"]
+            self.assertTrue(errors)
+            self.assertEqual(errors[-1]["action"], "abort")
+            self.assertEqual(records[-1]["completed"], 1)
+        finally:
+            tpm.close()
+
+    def test_crypto_hash_and_hmac(self):
+        # SHA-256("abc") and RFC 4231 section 4.2, HMAC-SHA-256 test case 1.
+        vectors = [
+            ("tpm.sha256(data)", b"", b"abc",
+             bytes.fromhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")),
+            ("tpm.hmac_sha256(key,data)", b"\x0b" * 20, b"Hi There",
+             bytes.fromhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")),
+        ]
+        for data in (b"", b"a\0b\0c"):
+            key = b"key\0with\0zeros"
+            vectors += [("tpm.sha256(data)", key, data, hashlib.sha256(data).digest()),
+                        ("tpm.hmac_sha256(key,data)", key, data, hmac.digest(key, data, "sha256"))]
+        vectors.append(("tpm.hmac_sha256(key,data)", b"", b"", hmac.digest(b"", b"", "sha256")))
+        for callback in ("on_request", "on_response"):
+            for expression, key, data, expected in vectors:
+                with self.subTest(expression=expression, data=data, callback=callback):
+                    self.crypto_success("assert(%s == expected)" % expression, callback,
+                                        key=key, data=data, expected=expected)
+
+    def test_crypto_aes_cfb(self):
+        # NIST SP 800-38A F.3.13/F.3.14, CFB128-AES128.
+        key = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+        iv = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+        ciphertext = bytes.fromhex("3b3fd92eb72dad20333449f8e83cfb4a"
+                                   "c8a64537a0b3a93fcde3cdad9f1ce58b"
+                                   "26751f67a3cbb140b1808cf187a4f4df"
+                                   "c04b05357c5d1c0eeac4c66f9ff7f2e6")
+        plaintext = bytes.fromhex("6bc1bee22e409f96e93d7e117393172a"
+                                  "ae2d8a571e03ac9c9eb76fac45af8e51"
+                                  "30c81c46a35ce411e5fbc1191a0a52ef"
+                                  "f69f2445df4f9b17ad2b417be66c3710")
+        for callback in ("on_request", "on_response"):
+            for length in (0, 1, 15, 16, 17, 31, 64):
+                with self.subTest(length=length, callback=callback):
+                    self.crypto_success("assert(tpm.aes_128_cfb_decrypt(key,iv,data) == expected)",
+                                        callback, key=key, iv=iv, data=ciphertext[:length],
+                                        expected=plaintext[:length])
+
+    def test_crypto_rsa_oaep(self):
+        key = bytes.fromhex(CRYPTO["private_der"])
+        modulus = bytes.fromhex(CRYPTO["modulus"])
+        salt = bytes.fromhex(CRYPTO["salt"])
+        known_label = bytes.fromhex(CRYPTO["label"])
+        known_ciphertext = bytes.fromhex(CRYPTO["ciphertext"])
+        self.assertEqual(oaep_encrypt(salt, known_label), known_ciphertext)
+        for callback in ("on_request", "on_response"):
+            for label in (known_label, b"", b"\0" * 64):
+                with self.subTest(label=label, callback=callback):
+                    ciphertext = known_ciphertext if label == known_label else oaep_encrypt(salt, label)
+                    records = self.crypto_success('''
+assert(tpm.rsa_oaep_sha256_decrypt(key,ciphertext,label) == salt)
+local encrypted = tpm.rsa_oaep_sha256_encrypt(modulus,65537,salt,label)
+assert(#encrypted == 256)
+tpm.log(encrypted)
+''', callback, key=key, ciphertext=ciphertext, label=label, salt=salt, modulus=modulus)
+                    logs = [bytes.fromhex(r["hex"]) for r in records if r["stage"] == "log"]
+                    self.assertEqual(len(logs), 1)
+                    self.assertEqual(oaep_decrypt(logs[0], label), salt)
+        for exponent in (3, 0xFFFFFFFF):
+            self.crypto_success("assert(#tpm.rsa_oaep_sha256_encrypt(modulus,%d,salt,label) == 256)"
+                                % exponent, modulus=modulus, salt=salt, label=known_label)
+
+    def test_crypto_kdfa(self):
+        # KDFa stays in Lua: counter || label || NUL || contexts || bit count.
+        for vector in CRYPTO["kdfa"]:
+            with self.subTest(label=vector["label"], bits=vector["bits"]):
+                self.crypto_success('''
+local function kdfa(key,label,u,v,bits)
+  local output = ""
+  for counter=1,(bits+255)//256 do
+    output = output .. tpm.hmac_sha256(key,
+      string.pack(">I4",counter)..label.."\\0"..u..v..string.pack(">I4",bits))
+  end
+  return output:sub(1,(bits+7)//8)
+end
+assert(kdfa(key,label,u,v,%d) == expected)
+''' % vector["bits"], key=bytes.fromhex(vector["key"]), label=vector["label"].encode(),
+                    u=bytes.fromhex(vector["context_u"]), v=bytes.fromhex(vector["context_v"]),
+                    expected=bytes.fromhex(vector["output"]))
+
+    def test_crypto_maximum_data_and_buffer_reuse(self):
+        data = b"x" * 1048576
+        self.crypto_success('''
+local data = string.rep("x",1048576)
+assert(tpm.sha256(data) == digest)
+assert(tpm.hmac_sha256(string.rep("k",1024),data) == mac)
+for i=1,32 do
+  assert(#tpm.aes_128_cfb_decrypt(string.rep("k",16),string.rep("i",16),data) == #data)
+end
+''', digest=hashlib.sha256(data).digest(), mac=hmac.digest(b"k" * 1024, data, "sha256"))
+
+    def test_crypto_memory_budget(self):
+        self.crypto_failure('''
+local data = string.rep("x",1048576)
+local retained = {}
+for i=1,32 do
+  retained[i] = tpm.aes_128_cfb_decrypt(string.rep("k",16),string.rep("i",16),data)
+end
+''')
+
+    def test_log_text_and_binary(self):
+        for callback in ("on_request", "on_response"):
+            tpm = self.tpm(self.crypto_script('''
+assert(print == nil and io == nil and os == nil and package == nil and debug == nil)
+assert(load == nil and loadfile == nil and dofile == nil and require == nil)
+tpm.log("normal diagnostic")
+tpm.log("binary\\0message\\0")
+''', callback))
+            self.assertEqual(tpm.command(STARTUP), packet(0))
+            logs = [r for r in tpm.stop() if r["stage"] == "log"]
+            self.assertEqual([bytes.fromhex(r["hex"]) for r in logs],
+                             [b"normal diagnostic", b"binary\0message\0"])
+            self.assertEqual([r["length"] for r in logs], [17, 15])
+            self.assertIn("Lua: normal diagnostic\n", (tpm.path / "stderr").read_text())
+
+    def test_crypto_argument_failures(self):
+        bindings = {name: bytes.fromhex(CRYPTO[field]) for name, field in
+                    (("key", "private_der"), ("modulus", "modulus"), ("salt", "salt"),
+                     ("ciphertext", "ciphertext"), ("label", "label"))}
+        bindings.update(aeskey=b"k" * 16, iv=b"i" * 16)
+        calls = [
+            ("sha256", ["salt"]),
+            ("hmac_sha256", ["salt", "salt"]),
+            ("rsa_oaep_sha256_decrypt", ["key", "ciphertext", "label"]),
+            ("rsa_oaep_sha256_encrypt", ["modulus", "65537", "salt", "label"]),
+            ("aes_128_cfb_decrypt", ["aeskey", "iv", "ciphertext"]),
+        ]
+        for function, args in calls:
+            for index in range(len(args)):
+                for invalid in ("nil", "false", "{}", "123"):
+                    # 123 is a valid exponent; separately reject numeric strings/floats.
+                    if function == "rsa_oaep_sha256_encrypt" and index == 1 and invalid == "123":
+                        continue
+                    broken = args.copy()
+                    broken[index] = invalid
+                    with self.subTest(function=function, argument=index + 1, invalid=invalid):
+                        self.crypto_failure("tpm.%s(%s)" % (function, ",".join(broken)), **bindings)
+        for exponent in ("0", "1", "2", "4", "-3", "4294967296", "4294967297",
+                         "65537.0", "3.5", "'65537'"):
+            with self.subTest(exponent=exponent):
+                self.crypto_failure("tpm.rsa_oaep_sha256_encrypt(modulus,%s,salt,label)" % exponent,
+                                    **bindings)
+        # Every declared maximum is exceeded by exactly one byte.
+        failures = [
+            "tpm.sha256(string.rep('x',1048577))",
+            "tpm.hmac_sha256(string.rep('k',1025),salt)",
+            "tpm.hmac_sha256(salt,string.rep('x',1048577))",
+            "tpm.aes_128_cfb_decrypt(aeskey,iv,string.rep('x',1048577))",
+            "tpm.rsa_oaep_sha256_decrypt(string.rep('x',4097),ciphertext,label)",
+            "tpm.rsa_oaep_sha256_decrypt(key,ciphertext..'x',label)",
+            "tpm.rsa_oaep_sha256_decrypt(key,ciphertext,string.rep('x',65))",
+            "tpm.rsa_oaep_sha256_encrypt(modulus..'x',65537,salt,label)",
+            "tpm.rsa_oaep_sha256_encrypt(modulus,65537,salt..'x',label)",
+            "tpm.rsa_oaep_sha256_encrypt(modulus,65537,salt,string.rep('x',65))",
+            "tpm.aes_128_cfb_decrypt(aeskey..'x',iv,salt)",
+            "tpm.aes_128_cfb_decrypt(aeskey,iv..'x',salt)",
+            "tpm.aes_128_cfb_decrypt(aeskey:sub(2),iv,salt)",
+            "tpm.aes_128_cfb_decrypt(aeskey,iv:sub(2),salt)",
+            "tpm.rsa_oaep_sha256_decrypt('',ciphertext,label)",
+            "tpm.rsa_oaep_sha256_decrypt(key,ciphertext:sub(2),label)",
+            "tpm.rsa_oaep_sha256_encrypt(modulus:sub(2),65537,salt,label)",
+            "tpm.rsa_oaep_sha256_encrypt(modulus,65537,salt:sub(2),label)",
+            "tpm.rsa_oaep_sha256_encrypt(modulus:sub(1,255)..'\\0',65537,salt,label)",
+            "tpm.rsa_oaep_sha256_encrypt('\\0'..modulus:sub(2),65537,salt,label)",
+        ]
+        for body in failures:
+            with self.subTest(body=body):
+                self.crypto_failure(body, **bindings)
+
+    def test_crypto_rsa_failures(self):
+        key = bytes.fromhex(CRYPTO["private_der"])
+        ciphertext = bytes.fromhex(CRYPTO["ciphertext"])
+        label = bytes.fromhex(CRYPTO["label"])
+        invalid_keys = [b"not DER", key[:-1], key + b"\0", key + key]
+        invalid_keys += [bytes.fromhex(CRYPTO[field]) for field in
+                         ("non_rsa_private_der", "wrong_size_private_der",
+                          "pkcs1_private_der", "encrypted_private_der")]
+        for index, invalid in enumerate(invalid_keys):
+            with self.subTest(key=index):
+                self.crypto_failure("tpm.rsa_oaep_sha256_decrypt(key,ciphertext,label)",
+                                    key=invalid, ciphertext=ciphertext, label=label)
+        invalid_pairs = [(bytes([ciphertext[0] ^ 1]) + ciphertext[1:], label),
+                         (b"\0" * 256, label), (ciphertext, b"SECRET"),
+                         (ciphertext, b"wrong\0")]
+        invalid_pairs += [(oaep_encrypt(b"x" * length, label), label) for length in (0, 31, 33, 190)]
+        for index, (invalid, wrong_label) in enumerate(invalid_pairs):
+            with self.subTest(ciphertext=index):
+                self.crypto_failure("tpm.rsa_oaep_sha256_decrypt(key,ciphertext,label)",
+                                    key=key, ciphertext=invalid, label=wrong_label)
 
     def test_pass_and_capture(self):
         for script in (None, PASS):

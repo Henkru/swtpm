@@ -116,6 +116,7 @@ EXTRA_DIST = \
 	data/keyfile.txt \
 	data/keyfile256bit.txt \
 	data/pwdfile.txt \
+	data/lua-crypto.json \
 	data/migkey1/tpm2-volatilestate.bin \
 	data/migkey1/volatilestate.bin \
 	data/tpmstate1/tpm-00.permall \

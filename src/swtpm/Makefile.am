@@ -75,7 +75,8 @@ libswtpm_libtpms_la_SOURCES += \
 endif
 
 if WITH_LUA
-libswtpm_libtpms_la_SOURCES += lua_intercept.c
+noinst_HEADERS += lua_crypto.h
+libswtpm_libtpms_la_SOURCES += lua_intercept.c lua_crypto.c
 endif
 
 libswtpm_libtpms_la_CFLAGS = \

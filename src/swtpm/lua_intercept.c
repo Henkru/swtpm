@@ -18,6 +18,7 @@
 #include <openssl/evp.h>
 
 #include "lua_intercept.h"
+#include "lua_crypto.h"
 #include "logging.h"
 #include "pcap.h"
 #include "utils.h"
@@ -253,6 +254,7 @@ static int initialize(lua_State *L)
     lua_newtable(L);
     lua_pushcfunction(L, script_log);
     lua_setfield(L, -2, "log");
+    lua_crypto_register(L);
     lua_setglobal(L, "tpm");
 
     if (luaL_loadbufferx(L, (const char *)li->script, li->script_length,

@@ -826,11 +826,76 @@ across TPM initialization generations. Automatic Startup/Shutdown bypass Lua.
 Lua is limited to 16 MiB and one million instructions per initialization or
 callback. Restricted base, string, table, and math operations are available;
 filesystem/process, package, coroutine, and debug libraries are absent. Loading,
-protected-call and metatable functions are removed. C<tpm.log(STRING)> provides
-up to 4096 bytes of diagnostic output per call. Scripts remain trusted inputs:
+protected-call and metatable functions are removed. Lua 5.4 C<string.pack>,
+C<string.unpack>, and native bitwise operators are available for binary parsing.
+Scripts remain trusted inputs:
 instruction limits are not wall-clock isolation for C library functions.
 Script errors, invalid returns, budget violations, and capture/delivery failures
 stop swtpm with a nonzero exit status, retaining partial artifacts.
+
+The global C<tpm> table provides the following in-memory helpers. All byte
+arguments and results are binary Lua strings, including embedded zero bytes;
+numbers are not converted to strings. Each crypto function returns one binary
+string on success. Bad arguments or cryptographic failures raise a Lua error
+and are recorded as fatal interception failures.
+
+=over 4
+
+=item C<digest = tpm.sha256(data)>
+
+Return the 32-byte SHA-256 digest. C<data> may be empty and is limited to 1 MiB
+(1048576 bytes).
+
+=item C<mac = tpm.hmac_sha256(key, data)>
+
+Return the 32-byte HMAC-SHA-256 value. C<key> is limited to 1 KiB (1024 bytes)
+and C<data> to 1 MiB. Either may be empty.
+
+=item C<plaintext = tpm.rsa_oaep_sha256_decrypt(private_der, ciphertext, label)>
+
+Decrypt an exactly 256-byte RSA-2048 ciphertext using OAEP with SHA-256 for both
+OAEP and MGF1. C<private_der> must contain one complete, unencrypted PKCS#8
+RSA-2048 private key, with no trailing DER, and must be nonempty and at most
+4 KiB (4096 bytes). The modulus must be positive, odd, and 2048 bits. The
+decrypted session salt must be exactly 32 bytes; other lengths are errors.
+
+=item C<ciphertext = tpm.rsa_oaep_sha256_encrypt(modulus, exponent, plaintext, label)>
+
+Encrypt an exactly 32-byte session salt using RSA-2048 OAEP with SHA-256 for
+both OAEP and MGF1. C<modulus> is exactly 256 bytes encoding an unsigned,
+big-endian, odd, 2048-bit integer. C<exponent> must be a Lua integer, odd and
+between 3 and 4294967295 inclusive. The script must translate a TPM-encoded
+exponent of zero to 65537 before calling this function. The result is exactly
+256 bytes; encryption uses OpenSSL randomness.
+
+For both RSA functions, C<label> is required and may contain at most 64 bytes,
+including any zero bytes. It is used exactly as supplied, without adding or
+removing a terminator. For example, the Lua string C<"SECRET\0"> supplies seven
+bytes. An empty label is valid.
+
+=item C<plaintext = tpm.aes_128_cfb_decrypt(key, iv, ciphertext)>
+
+Decrypt with AES-128-CFB128 without padding. C<key> and C<iv> must each be
+exactly 16 bytes. C<ciphertext> is limited to 1 MiB, may be empty, and need not
+be block-aligned. The result has exactly the same length as the ciphertext.
+
+=item C<tpm.log(message)>
+
+The supported output API; global C<print> is unavailable. C<message> must be a
+binary string. Its exact bytes are recorded as hex in a JSONL C<log> event when
+C<--lua-log-fd> is supplied, and a readable form is mirrored to stderr (which
+may stop at an embedded zero byte). The cumulative budget is 4096 bytes per
+initialization or callback, with each empty message charged one byte. Exceeding
+the budget or a write failure is fatal.
+
+=back
+
+Crypto argument limits bound work and allocations inside OpenSSL, outside
+Lua's instruction counter. Returned strings count toward the 16-MiB Lua memory
+limit. Temporary C plaintext and key material are cleaned up, but script-supplied
+private DER and returned plaintext remain in Lua memory until released or
+process exit; Lua does not guarantee that released string storage is wiped.
+No file I/O, dynamic loading, or additional Lua libraries are enabled.
 
 =item B<--lua-log-fd N>
 
