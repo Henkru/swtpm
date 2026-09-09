@@ -120,12 +120,16 @@ class TPM:
     def __init__(self, script=PASS, *, initialize=True, auto_shutdown=False,
                  passed_fd=False, script_fd=False, args=(), log_path=None,
                  backend_path=None, file_limit=None, direct_server=False,
-                 native_path=None):
+                 native_path=None, modules=None):
         self.tmp = tempfile.TemporaryDirectory(prefix="swtpm-lua-")
         self.path = Path(self.tmp.name)
         self.script = script
         source = self.path / "attack, with spaces.lua"
         source.write_text(script or "")
+        for name, contents in (modules or {}).items():
+            module = self.path / name
+            module.parent.mkdir(parents=True, exist_ok=True)
+            module.write_text(contents)
         self.client, data = socket.socketpair()
         self.control, control = socket.socketpair()
         self.client.settimeout(5)
@@ -163,7 +167,12 @@ class TPM:
             signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
             resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
 
-        self.process = subprocess.Popen(cmd + list(args), pass_fds=fds,
+        env = None
+        if modules:
+            env = os.environ.copy()
+            env["LUA_PATH"] = ";".join((str(self.path / "?.lua"),
+                                          str(self.path / "?/init.lua")))
+        self.process = subprocess.Popen(cmd + list(args), pass_fds=fds, env=env,
                                         preexec_fn=limit_files if file_limit else None,
                                         stdout=self.error, stderr=self.error)
         control.close()
@@ -352,8 +361,12 @@ end
     def test_log_text_and_binary(self):
         for callback in ("on_request", "on_response"):
             tpm = self.tpm(self.crypto_script('''
-assert(print == nil and io == nil and os == nil and package == nil and debug == nil)
-assert(load == nil and loadfile == nil and dofile == nil and require == nil)
+assert(print == nil and io == nil and os == nil and debug == nil)
+assert(load == nil and loadfile == nil and dofile == nil)
+assert(type(require) == "function" and type(package) == "table")
+assert(package.loadlib == nil and package.cpath == "")
+assert(type(package.searchers[1]) == "function")
+assert(type(package.searchers[2]) == "function" and package.searchers[3] == nil)
 tpm.log("normal diagnostic")
 tpm.log("binary\\0message\\0")
 ''', callback))
@@ -363,6 +376,28 @@ tpm.log("binary\\0message\\0")
                              [b"normal diagnostic", b"binary\0message\0"])
             self.assertEqual([r["length"] for r in logs], [17, 15])
             self.assertIn("Lua: normal diagnostic\n", (tpm.path / "stderr").read_text())
+
+    def test_require_lua_files(self):
+        script = '''local first
+return {api_version=1,on_request=function(ctx)
+  local helper = require("helpers.random")
+  first = first or helper
+  assert(helper == first and helper.value == 0x17b)
+  assert(require("helpers.random") == helper)
+end}'''
+        modules = {
+            "helpers/random.lua": '''local value = require("values.random")
+return {value=value}''',
+            "values/random.lua": "return 0x17b",
+        }
+        for script_fd in (False, True):
+            with self.subTest(script_fd=script_fd):
+                tpm = self.tpm(script, modules=modules, script_fd=script_fd)
+                self.assertEqual(tpm.command(STARTUP), packet(0))
+                # require caches modules after the first load.
+                (tpm.path / "helpers/random.lua").write_text("error('reloaded')")
+                self.assertEqual(tpm.command(RANDOM)[6:10], b"\0" * 4)
+                tpm.stop()
 
     def test_crypto_argument_failures(self):
         bindings = {name: bytes.fromhex(CRYPTO[field]) for name, field in
@@ -511,7 +546,7 @@ on_response=function(ctx) assert(#ctx.state.payload==100000) end}'''
 local seen = 0
 return {api_version=1,
 on_request=function(ctx, bytes)
-  assert(io == nil and os == nil and package == nil and debug == nil)
+  assert(io == nil and os == nil and package.loadlib == nil and debug == nil)
   assert(load == nil and pcall == nil and setmetatable == nil)
   assert(ctx.original_request == bytes)
   seen = seen + 1

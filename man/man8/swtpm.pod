@@ -825,9 +825,14 @@ across TPM initialization generations. Automatic Startup/Shutdown bypass Lua.
 
 Lua is limited to 16 MiB and one million instructions per initialization or
 callback. Restricted base, string, table, and math operations are available;
-filesystem/process, package, coroutine, and debug libraries are absent. Loading,
-protected-call and metatable functions are removed. Lua 5.4 C<string.pack>,
-C<string.unpack>, and native bitwise operators are available for binary parsing.
+filesystem/process, coroutine, and debug libraries are absent. C<require> and the
+package library's preload and Lua-file searchers are available. C<package.path>
+uses Lua's normal environment and compiled defaults and may be changed by the
+main script; relative entries are resolved against swtpm's working directory.
+Native modules remain disabled: C<package.loadlib> is absent, C<package.cpath> is
+empty, and the C searchers are removed. Loading outside C<require>, protected-call
+and metatable functions are removed. Lua 5.4 C<string.pack>, C<string.unpack>,
+and native bitwise operators are available for binary parsing.
 Scripts remain trusted inputs:
 instruction limits are not wall-clock isolation for C library functions.
 Script errors, invalid returns, budget violations, and capture/delivery failures
@@ -895,7 +900,9 @@ Lua's instruction counter. Returned strings count toward the 16-MiB Lua memory
 limit. Temporary C plaintext and key material are cleaned up, but script-supplied
 private DER and returned plaintext remain in Lua memory until released or
 process exit; Lua does not guarantee that released string storage is wiped.
-No file I/O, dynamic loading, or additional Lua libraries are enabled.
+Required Lua files are read when first requested and cached in C<package.loaded>;
+they are not included in the primary script snapshot or its SHA-256 digest. No
+general file I/O, native dynamic loading, or additional Lua libraries are enabled.
 
 =item B<--lua-log-fd N>
 

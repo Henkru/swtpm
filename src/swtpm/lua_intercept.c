@@ -228,6 +228,25 @@ static void rawfield(lua_State *L, int idx, const char *key)
     lua_rawget(L, idx);
 }
 
+static void open_package(lua_State *L)
+{
+    luaL_requiref(L, LUA_LOADLIBNAME, luaopen_package, 1);
+
+    /* require() needs the package library's preload and Lua-file searchers,
+     * but loading native modules would give scripts unrestricted process
+     * access. Keep package.path configurable and remove the C loaders. */
+    lua_pushnil(L);
+    lua_setfield(L, -2, "loadlib");
+    lua_pushliteral(L, "");
+    lua_setfield(L, -2, "cpath");
+    lua_getfield(L, -1, "searchers");
+    lua_pushnil(L);
+    lua_rawseti(L, -2, 3);
+    lua_pushnil(L);
+    lua_rawseti(L, -2, 4);
+    lua_pop(L, 2);
+}
+
 static int initialize(lua_State *L)
 {
     struct lua_intercept *li = owner(L);
@@ -251,6 +270,7 @@ static int initialize(lua_State *L)
     lua_pop(L, 1);
     luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1);
     lua_pop(L, 1);
+    open_package(L);
     lua_newtable(L);
     lua_pushcfunction(L, script_log);
     lua_setfield(L, -2, "log");
