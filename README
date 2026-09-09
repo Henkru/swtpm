@@ -13,6 +13,7 @@ the READMEs in the individual tool's directory under src/.
 
 This fork supports optional Lua request/response interception for socket TPM 2
 traffic. Build with --with-lua and see samples/lua/ for examples.
+See lua-interface.md for interception flow, callback context, and the tpm API.
 Lua hooks provide in-memory SHA-256, HMAC, RSA-OAEP and AES-CFB helpers.
 
 Please consult the Wiki for information about swtpm:

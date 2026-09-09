@@ -115,6 +115,40 @@ void mainloop_unlock_nvram(struct mainLoopParams *mlp,
     mlp->locking_retries = locking_retries;
 }
 
+#ifdef WITH_LUA
+struct lua_transmit_context {
+    struct mainLoopParams *mlp;
+    const bool *tpm_running;
+};
+
+static uint32_t mainloop_lua_transmit(void *opaque, unsigned char *command,
+                                     uint32_t length, unsigned char **response,
+                                     uint32_t *response_length, bool *executed)
+{
+    struct lua_transmit_context *ctx = opaque;
+    uint32_t capacity = 0;
+    uint32_t ordinal;
+
+    /* on_request runs before the external command's readiness checks. */
+    if (!*ctx->tpm_running) {
+        lua_intercept_fail(ctx->mlp->lua, "tpm.transmit: TPM is not running");
+        return TPM_FAIL;
+    }
+    if (!mainloop_ensure_locked_storage(ctx->mlp)) {
+        lua_intercept_fail(ctx->mlp->lua, "tpm.transmit: cannot lock TPM storage");
+        return TPM_FAIL;
+    }
+
+    ordinal = tpmlib_get_cmd_ordinal(command, length);
+    if (ordinal != TPM_ORDINAL_NONE)
+        ctx->mlp->lastCommand = ordinal;
+    *executed = true;
+    /* Inherit g_locality. Bypass both interception and swtpm-local commands;
+     * private buffers preserve the response currently being intercepted. */
+    return TPMLIB_Process(response, response_length, &capacity, command, length);
+}
+#endif
+
 int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
 {
     TPM_RESULT          rc = 0;
@@ -143,6 +177,9 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
     bool                synthetic = false, backend_executed;
     const char          *response_source;
     bool                intercept_failed = false;
+#ifdef WITH_LUA
+    struct lua_transmit_context transmit_context = { mlp, &tpm_running };
+#endif
     enum TPMLIB_TPMProperty prop = (mlp->tpmversion == TPMLIB_TPM_VERSION_1_2)
         ? TPMPROP_TPM_BUFFER_MAX
         : TPMPROP_TPM2_BUFFER_MAX;
@@ -167,6 +204,10 @@ int mainLoop(struct mainLoopParams *mlp, int notify_fd, bool tpm_running)
                   max_command_length);
         return TPM_FAIL;
     }
+
+#ifdef WITH_LUA
+    lua_intercept_set_transmit(mlp->lua, mainloop_lua_transmit, &transmit_context);
+#endif
 
     /* header and trailer that we may send by setting iov_len */
     iov[0].iov_base = &respprefix;
@@ -499,6 +540,9 @@ intercept_error:
     lua_intercept_complete(mlp->lua, rc ? rc : TPM_FAIL);
 
 shutdown:
+#ifdef WITH_LUA
+    lua_intercept_set_transmit(mlp->lua, NULL, NULL);
+#endif
     if (tpm_running && !mlp->disable_auto_shutdown)
         tpmlib_maybe_send_tpm2_shutdown(mlp->tpmversion, &mlp->lastCommand,
                                         &mlp->ps, mlp->lua);

@@ -631,6 +631,209 @@ end}'''
             records = tpm.stop()
             self.assertEqual(records[-1]["backend_exchanges"], 3 if enabled else 4)
 
+    def test_transmit_order_state_and_capture(self):
+        script = "local extend=%s\nlocal read=%s\n" % (lua_bytes(PCR_EXTEND), lua_bytes(PCR_READ))
+        script += '''
+local transmit = tpm.transmit
+local requests, responses = 0, 0
+return {api_version=1,
+on_request=function(ctx, bytes)
+  requests = requests + 1
+  assert(ctx.id == requests and ctx.transmit_limit == 64)
+  if ctx.id == 2 then
+    local response, rc = transmit(extend)
+    assert(rc == 0 and #response == 19)
+    ctx.state.before, rc = transmit(read)
+    assert(rc == 0)
+  end
+end,
+on_response=function(ctx, bytes)
+  responses = responses + 1
+  assert(ctx.id == responses and ctx.backend_executed and ctx.response_source == "tpm")
+  assert(ctx.original_request == ctx.effective_request)
+  if ctx.id == 2 then
+    assert(bytes == ctx.state.before)
+    local response, rc = transmit(extend)
+    assert(rc == 0)
+    local after, rc = transmit(read)
+    assert(rc == 0 and after ~= bytes and bytes == ctx.state.before)
+  end
+end}'''
+        tpm = self.tpm(script)
+        self.assertEqual(tpm.command(STARTUP), packet(0))
+        first = tpm.command(PCR_READ)
+        second = tpm.command(PCR_READ)
+        extended_once = hashlib.sha256(b"\0" * 32 + b"\1" * 32).digest()
+        self.assertEqual(first[-32:], extended_once)
+        self.assertEqual(second[-32:], hashlib.sha256(extended_once + b"\1" * 32).digest())
+        records = tpm.stop()
+        self.assertEqual(records[0]["transmit_limit"], 64)
+        self.assertEqual(records[-1]["transmit_calls"], 4)
+        self.assertEqual(records[-1]["transmit_responses"], 4)
+        self.assertEqual(records[-1]["backend_exchanges"], 3)
+        injected = [r for r in records if r.get("origin") == "lua"]
+        self.assertEqual([r["stage"] for r in injected], ["request", "processing", "response"] * 4)
+        self.assertEqual([r["sequence"] for r in injected], [n for n in range(1, 5) for _ in range(3)])
+        self.assertEqual([r["phase"] for r in injected], ["on_request"] * 6 + ["on_response"] * 6)
+        self.assertTrue(all(r["parent_id"] == 2 and r["generation"] == 1 for r in injected))
+        self.assertTrue(all(r["backend_executed"] for r in injected if r["stage"] != "request"))
+        self.assertEqual([bytes.fromhex(r["hex"]) for r in injected if r["stage"] == "request"],
+                         [PCR_EXTEND, PCR_READ] * 2)
+        stages = [(r["origin"], r["stage"]) for r in records
+                  if r.get("id") == 2 or r.get("parent_id") == 2]
+        self.assertLess(stages.index(("lua", "request")), stages.index(("external", "effective_request")))
+        # Additional commands are in JSONL only; both pcap boundaries stay intact.
+        expected = [(True, STARTUP), (False, packet(0)), (True, PCR_READ),
+                    (False, first), (True, PCR_READ), (False, second)]
+        self.assertEqual(capture(tpm.path / "native.pcapng"), expected)
+        self.assertEqual(capture(tpm.path / "backend.pcapng"), expected)
+
+    def test_transmit_synthetic_and_response_replacement(self):
+        script = "local startup=%s\nlocal random=%s\n" % (lua_bytes(STARTUP), lua_bytes(RANDOM))
+        script += '''return {api_version=1,
+on_request=function(ctx, bytes)
+  if ctx.command_code == 0x144 then
+    local response, rc = tpm.transmit(startup)
+    assert(rc == 0)
+    return {action="respond", bytes=response}
+  end
+end,
+on_response=function(ctx, bytes)
+  local response, rc = tpm.transmit(random)
+  assert(rc == 0 and #response == 28)
+  if ctx.command_code == 0x144 then
+    assert(ctx.response_source == "lua" and not ctx.backend_executed)
+    assert(ctx.effective_request == nil and #bytes == 10)
+  else
+    assert(ctx.response_source == "tpm" and ctx.backend_executed)
+    return {action="replace", bytes=response}
+  end
+end}'''
+        tpm = self.tpm(script)
+        self.assertEqual(tpm.command(STARTUP), packet(0))
+        response = tpm.command(CAPABILITY)
+        self.assertEqual(len(response), 28)
+        records = tpm.stop()
+        injected = [r for r in records if r.get("origin") == "lua" and r["stage"] == "response"]
+        self.assertEqual(response, bytes.fromhex(injected[-1]["hex"]))
+        self.assertEqual([r["sequence"] for r in injected], [1, 2, 1])
+        self.assertEqual(records[-1]["synthetic_exchanges"], 1)
+        self.assertEqual(records[-1]["response_replacements"], 1)
+        self.assertEqual(records[-1]["backend_exchanges"], 1)
+
+    def test_transmit_locality_and_tpm_errors(self):
+        reset = bytes.fromhex("80020000001b0000013d0000001400000009400000090000000000")
+        for callback in ("on_request", "on_response"):
+            with self.subTest(callback=callback):
+                script = "local reset=%s\n" % lua_bytes(reset)
+                script += '''return {api_version=1,%s=function(ctx)
+  if ctx.command_code == 0x17b then
+    local response, rc = tpm.transmit(reset)
+    assert(rc == string.unpack(">I4", response, 7))
+    assert(rc == (ctx.locality == 2 and 0 or 0x907))
+  end
+end}''' % callback
+                tpm = self.tpm(script)
+                tpm.command(STARTUP)
+                for locality in (2, 1):
+                    self.assertEqual(tpm.ctrl(5, bytes([locality])), b"\0" * 4)
+                    self.assertEqual(tpm.command(RANDOM)[6:10], b"\0" * 4)
+                records = tpm.stop()
+                injected = [r for r in records if r.get("origin") == "lua" and r["stage"] == "response"]
+                self.assertEqual([r["locality"] for r in injected], [2, 1])
+                self.assertEqual([r["result"] for r in injected], [0, 0x907])
+                self.assertFalse(records[-1]["failed"])
+
+    def test_transmit_budget(self):
+        script = "local random=%s\n" % lua_bytes(RANDOM)
+        script += '''local function many(ctx)
+  for i=1,ctx.transmit_limit do
+    local response, rc = tpm.transmit(random)
+    assert(rc == 0 and #response == 28)
+  end
+end
+return {api_version=1,
+on_request=function(ctx) if ctx.command_code == 0x17b then many(ctx) end end,
+on_response=function(ctx) if ctx.command_code == 0x17b then many(ctx) end end}'''
+        tpm = self.tpm(script)
+        tpm.command(STARTUP)
+        for _ in range(2):
+            self.assertEqual(tpm.command(RANDOM)[6:10], b"\0" * 4)
+        records = tpm.stop()
+        self.assertEqual(records[-1]["transmit_calls"], 256)
+        for callback in ("on_request", "on_response"):
+            script = self.crypto_script("for i=1,65 do tpm.transmit(command) end", callback,
+                                        command=RANDOM)
+            tpm = self.tpm(script)
+            tpm.client.sendall(STARTUP)
+            self.assertGreater(tpm.process.wait(timeout=5), 0)
+            self.assertIn("tpm.transmit budget exceeded", (tpm.path / "stderr").read_text())
+            self.assertEqual(tpm.records()[-1]["transmit_calls"], 64)
+
+    def test_transmit_argument_and_lifetime_failures(self):
+        bodies = ["tpm.transmit()", "tpm.transmit(123)", "tpm.transmit({})",
+                  "tpm.transmit(command, {})", "tpm.transmit('short')",
+                  "tpm.transmit(command .. command)",
+                  "tpm.transmit(string.pack('>I2I4I4',0x8000,10,0x17b))",
+                  "tpm.transmit(string.pack('>I2I4I4',0x8001,11,0x17b))"]
+        for callback in ("on_request", "on_response"):
+            for body in bodies:
+                with self.subTest(callback=callback, body=body):
+                    tpm = self.tpm(self.crypto_script(body, callback, command=RANDOM))
+                    tpm.client.sendall(STARTUP)
+                    self.assertGreater(tpm.process.wait(timeout=5), 0)
+                    self.assertTrue(tpm.records()[-1]["failed"])
+                    self.assertEqual(tpm.records()[-1]["transmit_calls"], 0)
+        tpm = self.tpm("tpm.transmit(%s)\n%s" % (lua_bytes(STARTUP), PASS))
+        self.assertGreater(tpm.process.wait(timeout=5), 0)
+        self.assertIn("requires an active", (tpm.path / "stderr").read_text())
+
+    def test_transmit_preinit_and_negotiated_limit(self):
+        for callback in ("on_request", "on_response"):
+            tpm = self.tpm(self.crypto_script("tpm.transmit(command)", callback, command=STARTUP),
+                           initialize=False)
+            tpm.client.sendall(STARTUP)
+            self.assertGreater(tpm.process.wait(timeout=5), 0)
+            self.assertIn("TPM is not running", (tpm.path / "stderr").read_text())
+            self.assertEqual(tpm.records()[-1]["transmit_responses"], 0)
+            processing = [r for r in tpm.records() if r.get("origin") == "lua" and
+                          r["stage"] == "processing"]
+            self.assertEqual(len(processing), 1)
+            self.assertFalse(processing[0]["backend_executed"])
+        script = '''return {api_version=1,on_request=function(ctx, bytes)
+local n=string.unpack(">I2",bytes,11)
+tpm.transmit(string.pack(">I2I4I4",0x8001,n,0x17b)..string.rep("x",n-10))
+end}'''
+        tpm = self.tpm(script, initialize=False)
+        response = tpm.ctrl(0x11, struct.pack(">I", 1024), 16)
+        negotiated = struct.unpack_from(">I", response, 4)[0]
+        tpm.client.sendall(packet(0x17b, struct.pack(">H", negotiated + 1)))
+        self.assertGreater(tpm.process.wait(timeout=5), 0)
+        self.assertIn("exceeds buffer limit", (tpm.path / "stderr").read_text())
+        self.assertEqual(tpm.records()[-1]["transmit_calls"], 0)
+
+    def test_transmit_shutdown_bookkeeping(self):
+        shutdown = packet(0x145, b"\0\0")
+        for callback in ("on_request", "on_response"):
+            script = "local shutdown=%s\n" % lua_bytes(shutdown)
+            script += '''return {api_version=1,
+on_request=function(ctx)
+  if ctx.command_code == 0x17b then
+    %s
+    return {action="respond", bytes=string.pack(">I2I4I4",0x8001,10,0)}
+  end
+end,
+on_response=function(ctx)
+  if ctx.command_code == 0x17b then %s end
+end}''' % ("tpm.transmit(shutdown)" if callback == "on_request" else "",
+           "tpm.transmit(shutdown)" if callback == "on_response" else "")
+            tpm = self.tpm(script, auto_shutdown=True)
+            tpm.command(STARTUP)
+            self.assertEqual(tpm.command(RANDOM), packet(0))
+            records = tpm.stop()
+            self.assertEqual(records[-1]["transmit_responses"], 1)
+            self.assertFalse(any(r.get("origin") == "internal" for r in records))
+
     def test_preinit_synthetic_and_swtpm_errors(self):
         script = '''return {api_version=1,
 on_request=function(ctx, bytes)

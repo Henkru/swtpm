@@ -19,6 +19,7 @@ EXTRA_DIST = \
 	LICENSE \
 	COPYING \
 	README \
+	lua-interface.md \
 	swtpm.spec \
 	autogen.sh
 

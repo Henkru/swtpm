@@ -28,6 +28,7 @@
 #define INSTRUCTION_LIMIT 1000000U
 #define HOOK_INTERVAL 1000U
 #define LOG_LIMIT 4096U
+#define TRANSMIT_LIMIT 64U
 
 struct bytes {
     unsigned char *data;
@@ -39,11 +40,17 @@ struct lua_intercept {
     size_t memory;
     unsigned int instructions, logged;
     bool failed, budget_failed, pending, responding, backend_executed;
+    bool handler_active, transmitting, transmit_executed;
     int callbacks[2], state_ref;
     uint64_t id, generation, exchange_generation, completed, backend_count;
     uint64_t request_replacements, response_replacements, synthetic_count, errors;
+    uint64_t transmit_calls, transmit_responses;
+    uint32_t transmitted, transmit_sequence;
     uint32_t locality, limit, stages;
     struct bytes original, effective, synthetic, final, replacement;
+    struct bytes transmit_command, transmit_response;
+    lua_intercept_transmit_fn transmit;
+    void *transmit_opaque;
     const unsigned char *input;
     size_t input_length;
     const char *source, *action;
@@ -75,6 +82,7 @@ static int record(struct lua_intercept *li, const char *stage, const char *origi
 {
     static const char hex[] = "0123456789abcdef";
     char header[768];
+    char extra[160] = "";
     char *payload = NULL;
     const unsigned char *bytes = data;
     size_t i;
@@ -82,17 +90,24 @@ static int record(struct lua_intercept *li, const char *stage, const char *origi
 
     if (li->log_fd < 0)
         return 0;
+    if (!strcmp(origin, "lua"))
+        snprintf(extra, sizeof(extra),
+                 "\"parent_id\":%" PRIu64 ",\"phase\":\"%s\",\"sequence\":%u,",
+                 li->id, li->responding ? "on_response" : "on_request",
+                 li->transmit_sequence);
     n = snprintf(header, sizeof(header),
                  "{\"stage\":\"%s\",\"origin\":\"%s\",\"id\":%" PRIu64
                  ",\"generation\":%" PRIu64 ",\"locality\":%u,"
                  "\"monotonic_ns\":%" PRIu64 ",\"action\":\"%s\","
                  "\"response_source\":\"%s\",\"backend_executed\":%s,"
-                 "\"result\":%u,\"buffer_limit\":%u,\"length\":%zu,\"hex\":",
+                 "\"result\":%u,\"buffer_limit\":%u,%s\"length\":%zu,\"hex\":",
                  stage, origin, !strcmp(origin, "external") ? li->id : 0,
                  li->pending ? li->exchange_generation : li->generation,
                  li->locality, monotonic_ns(), action,
-                 li->source ? li->source : "none",
-                 li->backend_executed ? "true" : "false", result, li->limit, length);
+                 !strcmp(origin, "lua") ? (li->transmit_executed ? "tpm" : "none") :
+                     (li->source ? li->source : "none"),
+                 (!strcmp(origin, "lua") ? li->transmit_executed : li->backend_executed) ?
+                     "true" : "false", result, li->limit, extra, length);
     if (n < 0 || (size_t)n >= sizeof(header))
         goto error;
     if (data) {
@@ -200,6 +215,94 @@ static int script_log(lua_State *L)
     return 0;
 }
 
+void lua_intercept_set_transmit(struct lua_intercept *li,
+                                lua_intercept_transmit_fn transmit, void *opaque)
+{
+    if (!li)
+        return;
+    li->transmit = transmit;
+    li->transmit_opaque = opaque;
+}
+
+static void free_transmit(struct lua_intercept *li)
+{
+    free(li->transmit_command.data);
+    free(li->transmit_response.data);
+    li->transmit_command = li->transmit_response = (struct bytes){0};
+    li->transmitting = false;
+}
+
+static bool valid_message(const unsigned char *data, size_t length,
+                           uint32_t limit, bool response)
+{
+    if (!data || length < 10 || length > limit || load32(data + 2) != length)
+        return false;
+    if (data[0] == 0x80 && (data[1] == 1 || data[1] == 2))
+        return true;
+    /* TPM 2 uses the legacy response tag specifically for TPM_RC_BAD_TAG. */
+    return response && data[0] == 0 && data[1] == 0xc4 && length == 10 &&
+           load32(data + 6) == 0x1e;
+}
+
+static int script_transmit(lua_State *L)
+{
+    struct lua_intercept *li = owner(L);
+    const unsigned char *command;
+    size_t length;
+    uint32_t result, rc;
+
+    if (!li->handler_active || !li->transmit || li->transmitting)
+        return luaL_error(L, "tpm.transmit requires an active request or response handler");
+    if (lua_gettop(L) != 1)
+        return luaL_error(L, "tpm.transmit requires exactly one command");
+    luaL_checktype(L, 1, LUA_TSTRING);
+    command = (const unsigned char *)lua_tolstring(L, 1, &length);
+    if (!valid_message(command, length, li->limit, false))
+        return luaL_error(L, "tpm.transmit command has invalid TPM 2 framing or exceeds buffer limit");
+    if (li->transmitted >= TRANSMIT_LIMIT)
+        return luaL_error(L, "tpm.transmit budget exceeded (64 commands per handler)");
+
+    /* libtpms takes mutable input. Keep all C allocations owned by li until
+     * copying the result into Lua succeeds; protected_call frees them on any
+     * Lua longjmp, including an allocation failure after TPM execution. */
+    li->transmit_command.data = malloc(length);
+    if (!li->transmit_command.data)
+        return luaL_error(L, "cannot allocate tpm.transmit command");
+    memcpy(li->transmit_command.data, command, length);
+    li->transmit_command.length = length;
+    li->transmitting = true;
+    li->transmit_executed = false;
+    li->transmitted++;
+    li->transmit_sequence++;
+    li->transmit_calls++;
+    if (record(li, "request", "lua", "bypass", command, length, 0))
+        return luaL_error(L, "tpm.transmit request log failed");
+    result = li->transmit(li->transmit_opaque, li->transmit_command.data, length,
+                          &li->transmit_response.data, &li->transmit_response.length,
+                          &li->transmit_executed);
+    if (record(li, "processing", "lua", result ? "failed" : "executed", NULL, 0, result))
+        return luaL_error(L, "tpm.transmit processing log failed");
+    if (result) {
+        record(li, "response", "lua", "absent", NULL, 0, result);
+        return luaL_error(L, "tpm.transmit processing failed (result %I)", (lua_Integer)result);
+    }
+    if (!valid_message(li->transmit_response.data, li->transmit_response.length,
+                       li->limit, true)) {
+        record(li, "response", "lua", "invalid", li->transmit_response.data,
+               li->transmit_response.length, 1);
+        return luaL_error(L, "tpm.transmit received an invalid TPM 2 response");
+    }
+    rc = load32(li->transmit_response.data + 6);
+    li->transmit_responses++;
+    if (record(li, "response", "lua", "bypass", li->transmit_response.data,
+               li->transmit_response.length, rc))
+        return luaL_error(L, "tpm.transmit response log failed");
+    lua_pushlstring(L, (const char *)li->transmit_response.data, li->transmit_response.length);
+    lua_pushinteger(L, rc);
+    free_transmit(li);
+    return 2;
+}
+
 /* Keep every allocation and script operation, including context construction
  * and result decoding, inside this protected C trampoline. */
 static int protected_call(struct lua_intercept *li, lua_CFunction fn)
@@ -212,6 +315,8 @@ static int protected_call(struct lua_intercept *li, lua_CFunction fn)
     lua_pushcfunction(L, fn); /* zero-upvalue C function: does not allocate */
     rc = lua_pcall(L, 0, 0, 0);
     lua_sethook(L, NULL, 0, 0);
+    li->handler_active = false;
+    free_transmit(li);
     if (rc != LUA_OK || li->budget_failed) {
         const char *message = lua_type(L, -1) == LUA_TSTRING ?
                               lua_tostring(L, -1) : "script failed (non-string error)";
@@ -274,6 +379,8 @@ static int initialize(lua_State *L)
     lua_newtable(L);
     lua_pushcfunction(L, script_log);
     lua_setfield(L, -2, "log");
+    lua_pushcfunction(L, script_transmit);
+    lua_setfield(L, -2, "transmit");
     lua_crypto_register(L);
     lua_setglobal(L, "tpm");
 
@@ -320,7 +427,6 @@ static int invoke(lua_State *L)
     const char *action, *data;
     size_t length, action_length;
     int callback = li->callbacks[li->responding];
-    bool valid_tag;
 
     if (!li->responding) {
         lua_newtable(L);
@@ -334,6 +440,7 @@ static int invoke(lua_State *L)
     set_integer(L, "generation", li->exchange_generation);
     set_integer(L, "tpm_version", 2);
     set_integer(L, "locality", li->locality);
+    set_integer(L, "transmit_limit", TRANSMIT_LIMIT);
     set_integer(L, "command_code", load32(li->original.data + 6));
     lua_rawgeti(L, LUA_REGISTRYINDEX, li->state_ref);
     lua_setfield(L, -2, "state");
@@ -351,7 +458,10 @@ static int invoke(lua_State *L)
         lua_setfield(L, -2, "response_source");
     }
     lua_pushlstring(L, (const char *)li->input, li->input_length);
+    li->transmitted = 0;
+    li->handler_active = true;
     lua_call(L, 2, 1);
+    li->handler_active = false;
     if (lua_isnil(L, -1))
         return 0;
     luaL_checktype(L, -1, LUA_TTABLE);
@@ -370,15 +480,8 @@ static int invoke(lua_State *L)
     rawfield(L, -1, "bytes");
     luaL_checktype(L, -1, LUA_TSTRING);
     data = lua_tolstring(L, -1, &length);
-    if (length < 10 || length > li->limit)
-        return luaL_error(L, "replacement has invalid TPM 2 framing or exceeds buffer limit");
-    valid_tag = (unsigned char)data[0] == 0x80 && (data[1] == 1 || data[1] == 2);
-    /* TPM 2 uses the legacy response tag specifically for TPM_RC_BAD_TAG. */
-    if ((li->responding || !strcmp(li->action, "respond")) &&
-        data[0] == 0 && (unsigned char)data[1] == 0xc4 && length == 10 &&
-        load32((const unsigned char *)data + 6) == 0x1e)
-        valid_tag = true;
-    if (!valid_tag || load32((const unsigned char *)data + 2) != length)
+    if (!valid_message((const unsigned char *)data, length, li->limit,
+                       li->responding || !strcmp(li->action, "respond")))
         return luaL_error(L, "replacement has invalid TPM 2 framing or exceeds buffer limit");
     if (copy_bytes(&li->replacement, data, length))
         return luaL_error(L, "cannot allocate replacement buffer");
@@ -454,6 +557,7 @@ int lua_intercept_request(struct lua_intercept *li, const unsigned char *request
     li->locality = locality;
     li->limit = limit;
     li->stages = 1;
+    li->transmit_sequence = 0;
     if (record(li, "original_request", "external", "accept", request, length, 0))
         return -1;
     if (copy_bytes(&li->original, request, length)) {
@@ -661,10 +765,11 @@ int lua_intercept_open(struct lua_intercept **out, const char *path,
                  "\"swtpm_version\":\"%s\",\"source_revision\":\"%s\","
                  "\"run_id\":\"%ld-%" PRIu64 "\",\"script_sha256\":\"%s\","
                  "\"memory_limit\":%u,\"instruction_limit\":%u,\"script_limit\":%u,"
-                 "\"log_limit\":%u,\"native_boundary\":\"external-original-request/final-response-and-internal\","
+                 "\"log_limit\":%u,\"transmit_limit\":%u,"
+                 "\"native_boundary\":\"external-original-request/final-response-and-internal\","
                  "\"backend_boundary\":\"external-TPMLIB_Process-only\"}\n",
                  LUA_RELEASE, VERSION, SWTPM_SOURCE_REVISION, (long)getpid(), monotonic_ns(),
-                 hash, MEMORY_LIMIT, INSTRUCTION_LIMIT, SCRIPT_LIMIT, LOG_LIMIT);
+                 hash, MEMORY_LIMIT, INSTRUCTION_LIMIT, SCRIPT_LIMIT, LOG_LIMIT, TRANSMIT_LIMIT);
     if (n < 0 || (size_t)n >= sizeof(manifest) ||
         (li->log_fd >= 0 && write_full(li->log_fd, manifest, n) != n))
         goto error;
@@ -687,7 +792,7 @@ error:
 
 int lua_intercept_close(struct lua_intercept *li)
 {
-    char summary[512];
+    char summary[768];
     int n, ret;
     if (!li)
         return 0;
@@ -705,8 +810,10 @@ int lua_intercept_close(struct lua_intercept *li)
                  ",\"completed\":%" PRIu64 ",\"backend_exchanges\":%" PRIu64
                  ",\"request_replacements\":%" PRIu64 ",\"response_replacements\":%" PRIu64
                  ",\"synthetic_exchanges\":%" PRIu64 ",\"errors\":%" PRIu64
+                 ",\"transmit_calls\":%" PRIu64 ",\"transmit_responses\":%" PRIu64
                  ",\"failed\":%s}\n", li->id, li->completed, li->backend_count,
                  li->request_replacements, li->response_replacements, li->synthetic_count, li->errors,
+                 li->transmit_calls, li->transmit_responses,
                  li->failed ? "true" : "false");
     if (li->log_fd >= 0) {
         if (write_full(li->log_fd, summary, n) != n)

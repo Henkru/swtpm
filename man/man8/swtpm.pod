@@ -815,7 +815,8 @@ declared length, and fit the negotiated buffer limit. Authentication is not
 recomputed.
 
 C<ctx> contains C<id>, C<generation>, C<tpm_version>, C<locality>,
-C<command_code>, C<original_request>, and a mutable per-exchange C<state> table.
+C<command_code>, C<original_request>, C<transmit_limit> (64), and a mutable
+per-exchange C<state> table.
 The response callback additionally receives C<effective_request>,
 C<effective_command_code>, C<backend_executed>, and C<response_source>
 (C<tpm>, C<swtpm>, or C<lua>). Synthetic exchanges have no effective request.
@@ -838,13 +839,50 @@ instruction limits are not wall-clock isolation for C library functions.
 Script errors, invalid returns, budget violations, and capture/delivery failures
 stop swtpm with a nonzero exit status, retaining partial artifacts.
 
-The global C<tpm> table provides the following in-memory helpers. All byte
+The global C<tpm> table provides command execution and in-memory helpers. All byte
 arguments and results are binary Lua strings, including embedded zero bytes;
 numbers are not converted to strings. Each crypto function returns one binary
 string on success. Bad arguments or cryptographic failures raise a Lua error
 and are recorded as fatal interception failures.
 
 =over 4
+
+=item C<response, rc = tpm.transmit(command)>
+
+Execute one complete raw TPM 2 command synchronously on the same TPM instance
+and return its complete binary response and the integer TPM response code from
+the response header. Only calls made during C<on_request> or C<on_response>,
+including through Lua helper functions, are allowed. Calls during script
+initialization are errors. Exactly one argument, a binary string, is required.
+Its tag must be C<0x8001> or C<0x8002>, its declared size must match the string
+length, and it must fit the negotiated buffer limit. Responses must also have
+valid framing and fit that limit.
+
+Additional commands execute immediately, in call order, and bypass both Lua
+callbacks and swtpm-local command handling such as SetLocality. They inherit the
+enclosing exchange's locality. In C<on_request> they finish before the effective
+external request executes; in C<on_response> they finish before the final
+external response is delivered. This also works in handlers that produce or
+receive synthetic replies, provided the TPM is running and storage is available.
+No automatic Startup or retry is performed. A nonzero TPM response code is a
+normal return for the script to handle; invalid arguments, unavailable TPM or
+storage, libtpms processing failures, invalid responses, and log failures are
+fatal interception errors.
+
+There are at most 64 additional commands per handler invocation, independently
+for the request and response handlers. C<ctx.transmit_limit> reports this limit;
+changing the context does not change enforcement. Returned strings count toward
+the Lua memory limit. The command count and Lua instruction limits do not bound
+wall-clock time spent executing TPM commands.
+
+Responses from additional commands go only to Lua. To deliver one to the client,
+explicitly return it in a C<respond> or C<replace> action. Additional commands
+do not change the enclosing exchange's context metadata, including
+C<backend_executed> and C<response_source>. They do change real TPM state,
+including handles, sessions, and persistent state. Changes are not rolled back
+if a subsequent command or handler fails or the handler returns a synthetic
+reply. Authentication is not recomputed for either additional or external
+commands. See F<samples/lua/transmit.lua> for an example.
 
 =item C<digest = tpm.sha256(data)>
 
@@ -911,6 +949,16 @@ source SHA-256, the exact source snapshot as hex, API/Lua versions, build source
 provenance, limits, original/effective requests, original/final responses,
 exchange IDs, initialization generations, monotonic timestamps, internal-command
 origin, processing and write results, diagnostics, and completion counters.
+Additional C<tpm.transmit> commands have C<origin="lua"> and C<id=0>, with
+C<parent_id> identifying the external exchange, C<phase> identifying
+C<on_request> or C<on_response>, and a one-based C<sequence> shared across both
+handlers and reset for each external exchange. Request, processing, and response
+records preserve call order. The processing C<result> is the libtpms status;
+the response C<result> is the TPM response code when a response is present.
+C<backend_executed> on these records describes the additional command.
+The manifest includes C<transmit_limit>; the run summary includes
+C<transmit_calls> (validated calls admitted to the budget, including failed
+attempts) and C<transmit_responses> (valid backend responses, including TPM errors).
 Unreached stages have null payloads. The launcher can decode the snapshot to
 C<attack.lua> and merge provenance into its own C<manifest.json>.
 
@@ -920,6 +968,9 @@ Write a second pcapng capture to a writable regular file. This capture contains
 only external requests dispatched to C<TPMLIB_Process()> and its original
 responses. Synthetic and swtpm-local replies produce no backend exchange.
 Internal automatic commands remain only in native capture and the event log.
+Additional C<tpm.transmit> commands and their responses are recorded only in
+the event log; they are excluded from both pcap captures. An additional response
+explicitly returned to the client appears as the final response in native capture.
 An empty backend capture is valid for an all-synthetic run.
 
 Artifact FDs are optional but recommended for recorded experiments, must refer

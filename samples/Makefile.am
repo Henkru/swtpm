@@ -31,6 +31,7 @@ EXTRA_DIST= \
 	lua/pass.lua \
 	lua/getrandom.lua \
 	lua/synthetic.lua \
+	lua/transmit.lua \
 	swtpm-create-tpmca \
 	swtpm-create-user-config-files \
 	swtpm-localca.conf \

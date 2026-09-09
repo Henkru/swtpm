@@ -8,6 +8,15 @@
 struct lua_intercept;
 
 #ifdef WITH_LUA
+/* The host returns the libtpms processing result and transfers a malloc-owned
+ * response (also on failure). executed distinguishes readiness failures from
+ * actual backend calls. The host must not call Lua or use exchange buffers. */
+typedef uint32_t (*lua_intercept_transmit_fn)(void *opaque,
+                                             unsigned char *command, uint32_t length,
+                                             unsigned char **response,
+                                             uint32_t *response_length, bool *executed);
+void lua_intercept_set_transmit(struct lua_intercept *li,
+                                lua_intercept_transmit_fn transmit, void *opaque);
 /* Input descriptors remain owned by the caller; the bridge duplicates them.
  * The exact text snapshot (at most 1 MiB) is hashed, logged, and loaded once. */
 int lua_intercept_open(struct lua_intercept **li, const char *path,
