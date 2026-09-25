@@ -160,11 +160,52 @@ For both RSA functions, `label` is required, may be empty, and is limited to
 64 bytes. It is used exactly as supplied, without adding or removing a
 terminator: `"SECRET\0"` supplies seven bytes.
 
+### `salt = tpm.ecc_p256_salt_from_private(private_der, ephemeral_point)`
+
+Derive a 32-byte TPM ECC session salt from an attacker-controlled static
+private key and a client's ephemeral public point. `private_der` must contain
+one complete, unencrypted PKCS#8 EC private key with no trailing DER, be
+nonempty, fit in 4 KiB, use the named `prime256v1`/NIST P-256 group, and contain
+valid private and public components. `ephemeral_point` is exactly 68 bytes: a
+32-byte unsigned big-endian X coordinate prefixed by `00 20`, followed by the
+same encoding for Y. Coordinates must be canonical field elements defining a
+non-infinity point on P-256.
+
+The helper performs P-256 ECDH and TPM KDFe with SHA-256, counter 1, the exact
+seven-byte label `"SECRET\0"`, the client ephemeral X coordinate as party U,
+and the private key's static public X coordinate as party V. The hash's complete
+32-byte output is returned.
+
+### `ephemeral_point, salt = tpm.ecc_p256_salt_to_public(static_point)`
+
+Generate a fresh P-256 ephemeral key using OpenSSL randomness, derive ECDH with
+the supplied static public point, and return the generated public point plus
+the 32-byte TPM KDFe salt. `static_point` and the returned point use the exact
+68-byte encoding described above. KDFe uses the generated ephemeral X
+coordinate as party U and the supplied static X coordinate as party V. A new
+ephemeral key is generated for every call; keys and points cannot be supplied
+in any other form and the label, hash, curve, ordering, and output length are
+not configurable.
+
+### `ciphertext = tpm.aes_128_cfb_encrypt(key, iv, plaintext)`
+
+Encrypt using AES-128-CFB128 without padding. `key` and `iv` must each be
+16 bytes. `plaintext` may be empty, is limited to 1 MiB, and need not be
+block-aligned. The result has the same length as the plaintext.
+
 ### `plaintext = tpm.aes_128_cfb_decrypt(key, iv, ciphertext)`
 
 Decrypt using AES-128-CFB128 without padding. `key` and `iv` must each be
 16 bytes. `ciphertext` may be empty, is limited to 1 MiB, and need not be
 block-aligned. The result has the same length as the ciphertext.
+
+Crypto-helper inputs are immutable Lua strings and cannot be wiped by these
+functions. Returned values are also Lua strings and are outside the C cleanup
+guarantee. The helpers cleanse C-owned staging buffers for ECDH shared secrets,
+derived salts, encoded ephemeral points, AES output, and partially produced
+results on both success and failure; OpenSSL owns and releases its internal key
+material. Errors use fixed non-secret text and do not include DER, points,
+shared secrets, salts, keys, IVs, or payload bytes.
 
 ### `tpm.log(message)`
 

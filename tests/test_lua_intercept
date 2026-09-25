@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import shlex
 import signal
 import socket
 import struct
@@ -15,11 +16,18 @@ import tempfile
 import time
 import unittest
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.decrepit.ciphers.modes import CFB
+
 
 SWTPM = os.environ.get("SWTPM", str(Path(os.environ.get("abs_top_builddir", ".")) /
                                   "src/swtpm/swtpm"))
 PASS = "return {api_version=1,on_request=function() end,on_response=function() end}"
 CRYPTO = json.loads((Path(__file__).resolve().parent / "data/lua-crypto.json").read_text())
+ECC = CRYPTO["ecc"]
+SWTPM_ARGS = tuple(shlex.split(os.environ.get("SWTPM_TEST_ARGS", "")))
 
 
 def lua_bytes(data):
@@ -59,6 +67,35 @@ def oaep_decrypt(ciphertext, label):
     padding, plaintext = db[32:].split(b"\1", 1)
     assert padding == b"\0" * len(padding)
     return plaintext
+
+
+def decode_tpm_p256_point(point):
+    """Decode the fixed Phase 3 TPMS_ECC_POINT form independently."""
+    assert len(point) == 68
+    assert point[:2] == b"\0\x20" and point[34:36] == b"\0\x20"
+    numbers = ec.EllipticCurvePublicNumbers(
+        int.from_bytes(point[2:34], "big"),
+        int.from_bytes(point[36:68], "big"), ec.SECP256R1())
+    return numbers.public_key()
+
+
+def kdfe_p256(secret, ephemeral_point, static_point, label=b"SECRET\0"):
+    """TPM KDFe/SHA-256 for the fixed 256-bit salt profile."""
+    assert len(secret) == 32
+    return hashlib.sha256(
+        struct.pack(">I", 1) + secret + label +
+        ephemeral_point[2:34] + static_point[2:34]).digest()
+
+
+def p256_ecdh(private_der, public_point):
+    private = serialization.load_der_private_key(private_der, password=None)
+    assert isinstance(private.curve, ec.SECP256R1)
+    return private.exchange(ec.ECDH(), decode_tpm_p256_point(public_point))
+
+
+def aes_cfb_encrypt(key, iv, plaintext):
+    encryptor = Cipher(algorithms.AES(key), CFB(iv)).encryptor()
+    return encryptor.update(plaintext) + encryptor.finalize()
 
 
 def packet(code, body=b"", tag=0x8001):
@@ -172,7 +209,8 @@ class TPM:
             env = os.environ.copy()
             env["LUA_PATH"] = ";".join((str(self.path / "?.lua"),
                                           str(self.path / "?/init.lua")))
-        self.process = subprocess.Popen(cmd + list(args), pass_fds=fds, env=env,
+        self.process = subprocess.Popen(cmd + list(SWTPM_ARGS) + list(args),
+                                        pass_fds=fds, env=env,
                                         preexec_fn=limit_files if file_limit else None,
                                         stdout=self.error, stderr=self.error)
         control.close()
@@ -292,9 +330,24 @@ class InterceptionTests(unittest.TestCase):
         for callback in ("on_request", "on_response"):
             for length in (0, 1, 15, 16, 17, 31, 64):
                 with self.subTest(length=length, callback=callback):
-                    self.crypto_success("assert(tpm.aes_128_cfb_decrypt(key,iv,data) == expected)",
-                                        callback, key=key, iv=iv, data=ciphertext[:length],
-                                        expected=plaintext[:length])
+                    self.crypto_success('''
+assert(tpm.aes_128_cfb_encrypt(key,iv,plaintext) == ciphertext)
+assert(tpm.aes_128_cfb_decrypt(key,iv,ciphertext) == plaintext)
+''', callback, key=key, iv=iv, plaintext=plaintext[:length],
+                                        ciphertext=ciphertext[:length])
+            for length in (2, 14, 18, 47, 255):
+                with self.subTest(randomized_length=length, callback=callback):
+                    random_key = hashlib.sha256(b"key" + bytes([length])).digest()[:16]
+                    random_iv = hashlib.sha256(b"iv" + bytes([length])).digest()[:16]
+                    random_plaintext = hashlib.shake_256(
+                        b"plaintext" + bytes([length])).digest(length)
+                    expected = aes_cfb_encrypt(random_key, random_iv, random_plaintext)
+                    self.crypto_success('''
+local encrypted = tpm.aes_128_cfb_encrypt(key,iv,plaintext)
+assert(encrypted == expected)
+assert(tpm.aes_128_cfb_decrypt(key,iv,encrypted) == plaintext)
+''', callback, key=random_key, iv=random_iv,
+                                        plaintext=random_plaintext, expected=expected)
 
     def test_crypto_rsa_oaep(self):
         key = bytes.fromhex(CRYPTO["private_der"])
@@ -319,6 +372,79 @@ tpm.log(encrypted)
         for exponent in (3, 0xFFFFFFFF):
             self.crypto_success("assert(#tpm.rsa_oaep_sha256_encrypt(modulus,%d,salt,label) == 256)"
                                 % exponent, modulus=modulus, salt=salt, label=known_label)
+
+    def test_crypto_ecc_fixed_vectors(self):
+        attacker_der = bytes.fromhex(ECC["attacker_private_der"])
+        attacker_point = bytes.fromhex(ECC["attacker_public_point"])
+        client_der = bytes.fromhex(ECC["client_private_der"])
+        client_point = bytes.fromhex(ECC["client_public_point"])
+        genuine_der = bytes.fromhex(ECC["genuine_private_der"])
+        genuine_point = bytes.fromhex(ECC["genuine_public_point"])
+        backend_der = bytes.fromhex(ECC["backend_ephemeral_private_der"])
+        backend_point = bytes.fromhex(ECC["backend_ephemeral_public_point"])
+
+        client_secret = p256_ecdh(attacker_der, client_point)
+        self.assertEqual(client_secret, bytes.fromhex(ECC["client_shared_secret"]))
+        self.assertEqual(p256_ecdh(client_der, attacker_point), client_secret)
+        client_salt = kdfe_p256(client_secret, client_point, attacker_point)
+        self.assertEqual(client_salt, bytes.fromhex(ECC["client_salt"]))
+        self.assertEqual(kdfe_p256(client_secret, attacker_point, client_point),
+                         bytes.fromhex(ECC["client_salt_swapped"]))
+        self.assertNotEqual(client_salt,
+                            kdfe_p256(client_secret, attacker_point, client_point))
+        self.assertEqual(kdfe_p256(client_secret, client_point, attacker_point,
+                                   b"SECRET"),
+                         bytes.fromhex(ECC["client_salt_without_label_nul"]))
+        self.assertNotEqual(client_salt,
+                            kdfe_p256(client_secret, client_point,
+                                      attacker_point, b"SECRET"))
+
+        backend_secret = p256_ecdh(backend_der, genuine_point)
+        self.assertEqual(backend_secret, bytes.fromhex(ECC["backend_shared_secret"]))
+        self.assertEqual(p256_ecdh(genuine_der, backend_point), backend_secret)
+        self.assertEqual(kdfe_p256(backend_secret, backend_point, genuine_point),
+                         bytes.fromhex(ECC["backend_salt"]))
+
+        for callback in ("on_request", "on_response"):
+            with self.subTest(callback=callback):
+                self.crypto_success('''
+assert(tpm.ecc_p256_salt_from_private(private_der,ephemeral_point) == expected)
+''', callback, private_der=attacker_der, ephemeral_point=client_point,
+                                    expected=client_salt)
+
+    def test_crypto_ecc_generated_salts(self):
+        genuine_der = bytes.fromhex(ECC["genuine_private_der"])
+        genuine_point = bytes.fromhex(ECC["genuine_public_point"])
+        for callback in ("on_request", "on_response"):
+            with self.subTest(callback=callback):
+                records = self.crypto_success('''
+local point1,salt1 = tpm.ecc_p256_salt_to_public(static_point)
+local point2,salt2 = tpm.ecc_p256_salt_to_public(static_point)
+assert(#point1 == 68 and #salt1 == 32)
+assert(#point2 == 68 and #salt2 == 32 and point1 ~= point2)
+tpm.log(point1..salt1)
+tpm.log(point2..salt2)
+''', callback, static_point=genuine_point)
+                generated = [bytes.fromhex(record["hex"]) for record in records
+                             if record["stage"] == "log"]
+                self.assertEqual(len(generated), 2)
+                self.assertNotEqual(generated[0][:68], generated[1][:68])
+                for value in generated:
+                    point, salt = value[:68], value[68:]
+                    secret = p256_ecdh(genuine_der, point)
+                    self.assertEqual(salt, kdfe_p256(secret, point, genuine_point))
+
+    def test_crypto_ecc_result_memory_budget(self):
+        # Pre-size the tables before consuming most of Lua's 16-MiB budget so
+        # the eventual allocation failure occurs while copying a result pair.
+        self.crypto_failure('''
+local points,salts = {},{}
+for i=1,5000 do points[i]=false salts[i]=false end
+local padding = string.rep("x",15*1024*1024)
+for i=1,5000 do
+  points[i],salts[i] = tpm.ecc_p256_salt_to_public(static_point)
+end
+''', static_point=bytes.fromhex(ECC["genuine_public_point"]))
 
     def test_crypto_kdfa(self):
         # KDFa stays in Lua: counter || label || NUL || contexts || bit count.
@@ -345,18 +471,21 @@ local data = string.rep("x",1048576)
 assert(tpm.sha256(data) == digest)
 assert(tpm.hmac_sha256(string.rep("k",1024),data) == mac)
 for i=1,32 do
+  assert(#tpm.aes_128_cfb_encrypt(string.rep("k",16),string.rep("i",16),data) == #data)
   assert(#tpm.aes_128_cfb_decrypt(string.rep("k",16),string.rep("i",16),data) == #data)
 end
 ''', digest=hashlib.sha256(data).digest(), mac=hmac.digest(b"k" * 1024, data, "sha256"))
 
     def test_crypto_memory_budget(self):
-        self.crypto_failure('''
+        for function in ("aes_128_cfb_encrypt", "aes_128_cfb_decrypt"):
+            with self.subTest(function=function):
+                self.crypto_failure('''
 local data = string.rep("x",1048576)
 local retained = {}
 for i=1,32 do
-  retained[i] = tpm.aes_128_cfb_decrypt(string.rep("k",16),string.rep("i",16),data)
+  retained[i] = tpm.%s(string.rep("k",16),string.rep("i",16),data)
 end
-''')
+''' % function)
 
     def test_log_text_and_binary(self):
         for callback in ("on_request", "on_response"):
@@ -403,12 +532,17 @@ return {value=value}''',
         bindings = {name: bytes.fromhex(CRYPTO[field]) for name, field in
                     (("key", "private_der"), ("modulus", "modulus"), ("salt", "salt"),
                      ("ciphertext", "ciphertext"), ("label", "label"))}
-        bindings.update(aeskey=b"k" * 16, iv=b"i" * 16)
+        bindings.update(aeskey=b"k" * 16, iv=b"i" * 16,
+                        ecckey=bytes.fromhex(ECC["attacker_private_der"]),
+                        point=bytes.fromhex(ECC["client_public_point"]))
         calls = [
             ("sha256", ["salt"]),
             ("hmac_sha256", ["salt", "salt"]),
             ("rsa_oaep_sha256_decrypt", ["key", "ciphertext", "label"]),
             ("rsa_oaep_sha256_encrypt", ["modulus", "65537", "salt", "label"]),
+            ("ecc_p256_salt_from_private", ["ecckey", "point"]),
+            ("ecc_p256_salt_to_public", ["point"]),
+            ("aes_128_cfb_encrypt", ["aeskey", "iv", "ciphertext"]),
             ("aes_128_cfb_decrypt", ["aeskey", "iv", "ciphertext"]),
         ]
         for function, args in calls:
@@ -431,13 +565,19 @@ return {value=value}''',
             "tpm.sha256(string.rep('x',1048577))",
             "tpm.hmac_sha256(string.rep('k',1025),salt)",
             "tpm.hmac_sha256(salt,string.rep('x',1048577))",
+            "tpm.aes_128_cfb_encrypt(aeskey,iv,string.rep('x',1048577))",
             "tpm.aes_128_cfb_decrypt(aeskey,iv,string.rep('x',1048577))",
+            "tpm.ecc_p256_salt_from_private(string.rep('x',4097),point)",
             "tpm.rsa_oaep_sha256_decrypt(string.rep('x',4097),ciphertext,label)",
             "tpm.rsa_oaep_sha256_decrypt(key,ciphertext..'x',label)",
             "tpm.rsa_oaep_sha256_decrypt(key,ciphertext,string.rep('x',65))",
             "tpm.rsa_oaep_sha256_encrypt(modulus..'x',65537,salt,label)",
             "tpm.rsa_oaep_sha256_encrypt(modulus,65537,salt..'x',label)",
             "tpm.rsa_oaep_sha256_encrypt(modulus,65537,salt,string.rep('x',65))",
+            "tpm.aes_128_cfb_encrypt(aeskey..'x',iv,salt)",
+            "tpm.aes_128_cfb_encrypt(aeskey,iv..'x',salt)",
+            "tpm.aes_128_cfb_encrypt(aeskey:sub(2),iv,salt)",
+            "tpm.aes_128_cfb_encrypt(aeskey,iv:sub(2),salt)",
             "tpm.aes_128_cfb_decrypt(aeskey..'x',iv,salt)",
             "tpm.aes_128_cfb_decrypt(aeskey,iv..'x',salt)",
             "tpm.aes_128_cfb_decrypt(aeskey:sub(2),iv,salt)",
@@ -452,6 +592,44 @@ return {value=value}''',
         for body in failures:
             with self.subTest(body=body):
                 self.crypto_failure(body, **bindings)
+
+    def test_crypto_ecc_failures(self):
+        private = bytes.fromhex(ECC["attacker_private_der"])
+        point = bytes.fromhex(ECC["client_public_point"])
+        parsed = serialization.load_der_private_key(private, password=None)
+        public_der = parsed.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)
+        sec1_der = parsed.private_bytes(
+            serialization.Encoding.DER,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption())
+        encrypted_der = parsed.private_bytes(
+            serialization.Encoding.DER,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(b"test password"))
+        invalid_private = [b"not DER", private[:-1], private + b"\0",
+                           bytes.fromhex(CRYPTO["private_der"]),
+                           bytes.fromhex(ECC["wrong_curve_private_der"]),
+                           bytes.fromhex(ECC["missing_public_private_der"]),
+                           public_der, sec1_der, encrypted_der]
+        for index, value in enumerate(invalid_private):
+            with self.subTest(private=index):
+                self.crypto_failure(
+                    "tpm.ecc_p256_salt_from_private(private,point)",
+                    private=value, point=point)
+
+        invalid_points = [point[:-1], point + b"\0", b"\0" * 68,
+                          b"\x04" + point[2:]]
+        invalid_points += [bytes.fromhex(value) for value in
+                           ECC["invalid_points"].values()]
+        for index, value in enumerate(invalid_points):
+            for function, bindings in (
+                    ("tpm.ecc_p256_salt_from_private(private,point)",
+                     {"private": private, "point": value}),
+                    ("tpm.ecc_p256_salt_to_public(point)", {"point": value})):
+                with self.subTest(point=index, function=function):
+                    self.crypto_failure(function, **bindings)
 
     def test_crypto_rsa_failures(self):
         key = bytes.fromhex(CRYPTO["private_der"])
